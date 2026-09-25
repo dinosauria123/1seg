@@ -21,13 +21,12 @@ use isdbt_dsp::deinterleave::{data_carrier_indices, freq_deinterleave, TimeDeint
 use isdbt_dsp::demap::{qpsk_soft, BitDeinterleaverQpsk};
 use isdbt_dsp::demod::OfdmDemod;
 use isdbt_dsp::equalize::{
-    detect_symbol_phase, equalize, estimate_channel, extract_segment, SEGMENT_BIN_OFFSET,
+    equalize, estimate_channel, phase_scores_gr_isdbt, track_symbol_phases,
 };
 use isdbt_dsp::iq::u8_iq_to_complex;
 use isdbt_dsp::params::FFT_LEN;
 use isdbt_dsp::pilots::SegmentPilots;
 use isdbt_dsp::rs;
-use isdbt_dsp::sync::estimate_sync;
 use isdbt_dsp::ts::{
     best_sync_phase, pack_bits_msb, ByteDeinterleaver, EnergyPrbs, BI_I, BI_M, TSP,
 };
@@ -67,6 +66,11 @@ fn main() {
     let _fs: f64 = a.next().expect("fs").parse().expect("fs");
     let outpath = a.next().expect("out.ts");
     let nsym: usize = a.next().map(|s| s.parse().unwrap()).unwrap_or(11000);
+    // セグメントの bin offset（fftshift 済みスペクトルでの1seg先頭）。既定はライブラリ既定値。
+    let seg_off: usize = a
+        .next()
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(isdbt_dsp::SEGMENT_BIN_OFFSET);
 
     // ① IQ → DC除去
     let rawf = fs::read(&path).expect("IQ読み込み");
@@ -79,17 +83,22 @@ fn main() {
     let seg_sig = &s[off..];
 
     // ② 同期 → 復調
-    let est = estimate_sync(seg_sig, FFT_LEN).expect("同期できない");
+    let est = isdbt_dsp::sync::estimate_symbol_sync(seg_sig, FFT_LEN, isdbt_dsp::params::GuardInterval::G1_8).expect("同期できない");
     let demod = OfdmDemod::new(FFT_LEN);
-    let specs = demod.demod_stream(
+    let specs = demod.demod_stream_tracked(
         seg_sig,
         est.symbol_start,
         est.guard,
         est.cfo_subcarriers,
         nsym,
+        8,
     );
     let pilots = SegmentPilots::center_1seg();
-    let (phase0, _) = detect_symbol_phase(&extract_segment(&specs[0], SEGMENT_BIN_OFFSET), &pilots);
+    let phase_rows: Vec<[f32; 4]> = specs
+        .iter()
+        .map(|sp| phase_scores_gr_isdbt(&sp[seg_off..seg_off + 432], &pilots))
+        .collect();
+    let phases = track_symbol_phases(&phase_rows);
 
     // ③④ 等化 → データ抽出 → 周波数/時間デインタ → QPSKソフトデマップ → ビットデインタ
     //   → 確定順(order=1)で符号ソフト列
@@ -98,8 +107,8 @@ fn main() {
     let warmup = tdi.latency() + bdi.latency();
     let mut coded: Vec<f32> = Vec::new();
     for (k, sp) in specs.iter().enumerate() {
-        let sym_mod4 = (phase0 + k) % 4;
-        let seg = extract_segment(sp, SEGMENT_BIN_OFFSET);
+        let sym_mod4 = phases[k];
+        let seg = sp[seg_off..seg_off + 432].to_vec();
         let h = estimate_channel(&seg, sym_mod4, &pilots);
         let eq = equalize(&seg, &h);
         let data: Vec<Complex32> = data_carrier_indices(sym_mod4, &pilots)
@@ -140,9 +149,7 @@ fn main() {
     for c in 0..BI_I {
         let stream = make_blocks(c);
         let (phase, sc) = best_sync_phase(&stream);
-        if sc < 0.9 {
-            continue;
-        }
+        if sc < 0.9 { continue; }
         let blocks: Vec<&[u8]> = (0..)
             .map(|i| phase + i * TSP)
             .take_while(|&i| i + TSP <= stream.len())
@@ -151,15 +158,9 @@ fn main() {
         let ncheck = 128.min(blocks.len());
         for reset_off in 0..RESET_PERIOD {
             let ds = descramble(&blocks, reset_off);
-            let ok = ds
-                .iter()
-                .take(ncheck)
-                .filter(|b| rs::decode(b).is_some())
-                .count();
+            let ok = ds.iter().take(ncheck).filter(|b| rs::decode(b).is_some()).count();
             let f = ok as f32 / ncheck as f32;
-            if f > best.0 {
-                best = (f, c, reset_off, phase);
-            }
+            if f > best.0 { best = (f, c, reset_off, phase); }
         }
     }
     let (frac, commutator, reset_off, phase) = best;

@@ -13,7 +13,8 @@
 //! - 1セグ（部分受信）は **Layer A**。中央セグメント内のTMCCキャリアは絶対index
 //!   2693/2723/2878/2941 → ローカル(=−2592) **101/131/286/349** の4本。
 
-use crate::pilots::CENTER_SEGMENT_OFFSET;
+use crate::equalize::{equalize, estimate_channel, phase_scores_gr_isdbt, track_symbol_phases};
+use crate::pilots::{CENTER_SEGMENT_OFFSET, SegmentPilots};
 use num_complex::Complex32;
 
 /// 中央セグメント内のTMCCキャリア（ローカルindex）。絶対 2693/2723/2878/2941。
@@ -123,7 +124,28 @@ fn layer_at(frame: &[u8], base: usize) -> LayerInfo {
     }
 }
 
-/// 204bitのフレーム（`frame[0]=B0`）からTMCC情報をパースする。
+/// TMCC information field uses the BCH(273,191) parity structure used by
+/// gr-isdbt. The 184 information bits are prefixed by 89 zero reference bits
+/// before the 82 syndrome equations are evaluated.
+pub fn tmcc_bch_ok(frame: &[u8]) -> bool {
+    const H: [u8; 192] = [
+        1,0,0,0,1,0,0,0,1,0,1,0,1,0,0,0,1,0,0,0,0,0,1,0,
+        1,0,0,0,1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,1,0,1,0,
+        1,0,0,0,1,0,1,0,0,0,0,0,0,0,1,0,1,0,1,1,1,0,1,1,
+        0,0,0,1,1,1,1,1,0,0,1,1,0,1,0,0,1,0,0,0,0,1,0,1,
+        0,1,1,1,0,1,1,1,0,0,1,0,1,1,1,1,1,0,1,0,0,0,0,1,
+        1,1,1,1,0,1,0,1,1,0,1,0,0,1,1,1,0,0,0,1,1,0,0,0,
+        0,1,0,0,0,0,1,0,0,0,1,1,0,0,1,0,1,0,1,0,0,1,0,1,
+        1,1,1,1,0,1,1,0,0,0,0,1,1,1,0,0,0,1,1,0,0,0,0,1,
+    ];
+    if frame.len() < 204 {
+        return false;
+    }
+    let mut large = [0u8; 273];
+    large[89..].copy_from_slice(&frame[20..204]);
+    (0..82).all(|j| (0..192).map(|i| (large[i + j] & H[i]) as u32).sum::<u32>() % 2 == 0)
+}
+
 pub fn parse_tmcc(frame: &[u8]) -> TmccInfo {
     TmccInfo {
         system_id: bits_be(frame, 20, 2),
@@ -154,7 +176,155 @@ pub fn dbpsk_bits(segments: &[Vec<Complex32>]) -> Vec<u8> {
     bits
 }
 
-/// フレーム同期の結果。
+/// TMCCキャリアをSPで推定したチャネルで等化し、各キャリアを個別に
+/// 判定して多数決するDBPSK復号。
+fn equalized_dbpsk_bits_for_origin(segments: &[Vec<Complex32>], origin: usize) -> Vec<u8> {
+    let pilots = SegmentPilots::center_1seg();
+    let score_rows: Vec<[f32; 4]> = segments.iter().map(|s| phase_scores_gr_isdbt(s, &pilots)).collect();
+    let phases = track_symbol_phases(&score_rows);
+    let mut bits = Vec::with_capacity(segments.len().saturating_sub(1));
+    for k in 1..segments.len() {
+        let p0 = (phases[k - 1] + origin) % 4;
+        let p1 = (phases[k] + origin) % 4;
+        let h0 = estimate_channel(&segments[k - 1], p0, &pilots);
+        let h1 = estimate_channel(&segments[k], p1, &pilots);
+        let e0 = equalize(&segments[k - 1], &h0);
+        let e1 = equalize(&segments[k], &h1);
+        let mut votes = 0i32;
+        for &c in &TMCC_LOCAL_CARRIERS {
+            let d = e1[c] * e0[c].conj();
+            votes += if d.re < 0.0 { 1 } else { -1 };
+        }
+        bits.push(u8::from(votes > 0));
+    }
+    bits
+}
+
+/// TMCC同期語の最大一致率を4つの巡回symbol originごとに返す。
+pub fn phase_offset_scores(segments: &[Vec<Complex32>]) -> [f32; 4] {
+    let mut out = [0.0f32; 4];
+    for origin in 0..4 {
+        let bits = equalized_dbpsk_bits_for_origin(segments, origin);
+        if let Some(fs) = find_frame_sync(&bits) {
+            out[origin] = if fs.total > 0 { fs.matched as f32 / fs.total as f32 } else { 0.0 };
+        }
+    }
+    out
+}
+
+pub fn equalized_dbpsk_bits_with_phases(segments: &[Vec<Complex32>]) -> Vec<u8> {
+    let pilots = SegmentPilots::center_1seg();
+    let score_rows: Vec<[f32; 4]> = segments.iter().map(|s| phase_scores_gr_isdbt(s, &pilots)).collect();
+    let phases = track_symbol_phases(&score_rows);
+    let mut bits = Vec::with_capacity(segments.len().saturating_sub(1));
+    for k in 1..segments.len() {
+        let h0 = estimate_channel(&segments[k - 1], phases[k - 1], &pilots);
+        let h1 = estimate_channel(&segments[k], phases[k], &pilots);
+        let e0 = equalize(&segments[k - 1], &h0);
+        let e1 = equalize(&segments[k], &h1);
+        let mut votes = 0i32;
+        for &c in &TMCC_LOCAL_CARRIERS {
+            let d = e1[c] * e0[c].conj();
+            votes += if d.re < 0.0 { 1 } else { -1 };
+        }
+        bits.push(u8::from(votes > 0));
+    }
+    bits
+}
+
+pub fn equalized_dbpsk_bits(segments: &[Vec<Complex32>]) -> Vec<u8> {
+    equalized_dbpsk_bits_with_phases(segments)
+}
+
+pub fn estimate_integer_offset(
+    spectra: &[Vec<Complex32>],
+    nominal_offset: usize,
+    search_radius: usize,
+) -> Option<usize> {
+    let max_offset = nominal_offset.checked_add(search_radius)?;
+    let min_offset = nominal_offset.saturating_sub(search_radius);
+    if spectra.is_empty() || max_offset + 432 > spectra[0].len() {
+        return None;
+    }
+    let mut best = None;
+    for offset in min_offset..=max_offset {
+        let score = integer_offset_score_at(spectra, offset);
+        if best.map_or(true, |(_, b): (usize, f32)| score > b) {
+            best = Some((offset, score));
+        }
+    }
+    best.map(|(offset, _)| offset)
+}
+
+/// 1segセグメントの bin offset を推定する（`estimate_integer_offset` の強化版）。
+///
+/// 素朴な [`integer_offset_score`] だけでは偽陽性が出るので、TMCC の**フレーム同期一致率**を
+/// 主目的とし、既知キャリア位相スコアで同点を割る。`tmcc_probe` が使っていた探索を
+/// ライブラリ側へ移したもの。
+///
+/// 返り値は `(offset, 同期一致率, 既知キャリアスコア)`。信号が無ければ
+/// 同期一致率は 60〜75% の偽ロックに張り付くので、呼び出し側は
+/// [`FrameSync::is_true_lock`] も併せて確認すること。
+pub fn select_segment_offset(
+    spectra: &[Vec<Complex32>],
+    search_radius: usize,
+) -> Option<(usize, f32, f32)> {
+    let nominal = crate::equalize::SEGMENT_BIN_OFFSET;
+    let lo = nominal.saturating_sub(search_radius);
+    let hi = nominal + search_radius;
+    if spectra.is_empty() || hi + 432 > spectra[0].len() {
+        return None;
+    }
+    let mut best: Option<(usize, f32, f32)> = None;
+    for off in (lo..=hi).rev() {
+        let segs: Vec<Vec<Complex32>> = spectra
+            .iter()
+            .map(|sp| sp[off..off + 432].to_vec())
+            .collect();
+        let bits = equalized_dbpsk_bits(&segs);
+        let sync = find_frame_sync_joint(&bits)
+            .map(|s| s.matched as f32 / s.total as f32)
+            .unwrap_or(0.0);
+        let known = integer_offset_score(spectra, off);
+        // 同期一致が主目的、既知キャリアスコアは同点割りのタイブレーク。
+        let score = sync * 1000.0 + known;
+        let better = match best {
+            None => true,
+            Some((_, bs, bk)) => score > bs * 1000.0 + bk,
+        };
+        if better {
+            best = Some((off, sync, known));
+        }
+    }
+    best
+}
+
+/// Score independent of TMCC data bits: correlate adjacent TMCC carriers
+/// after applying their known PRBS phase relation, as gr-isdbt does.
+pub fn integer_offset_score(spectra: &[Vec<Complex32>], offset: usize) -> f32 {
+    integer_offset_score_at(spectra, offset)
+}
+
+fn integer_offset_score_at(spectra: &[Vec<Complex32>], offset: usize) -> f32 {
+    let pilots = SegmentPilots::center_1seg();
+    let mut total = 0.0f32;
+    for s in spectra {
+        if offset + 432 > s.len() {
+            return 0.0;
+        }
+        let mut sum = 0.0f32;
+        for pair in TMCC_LOCAL_CARRIERS.windows(2) {
+            let a = s[offset + pair[0]];
+            let b = s[offset + pair[1]];
+            let expected = pilots.values[pair[0]] * pilots.values[pair[1]];
+            sum += (b * a.conj() * expected).re;
+        }
+        total += sum.abs();
+    }
+    total / spectra.len().max(1) as f32
+}
+
+
 #[derive(Clone, Debug)]
 pub struct FrameSync {
     /// ビット列中で `B0` に当たる位置。フレームは `phase + 204*f` ごと。
@@ -168,10 +338,38 @@ pub struct FrameSync {
     pub parity_per_frame: Vec<bool>,
     /// even/odd が1フレームごとに交互だったか（強い整合チェック）。
     pub alternates: bool,
+    /// 多数決フレームがBCH検査を通過したか。
+    pub bch_valid: bool,
+    /// 同期語16bitのうち、全フレームで一貫して一致した位置の数。
+    ///
+    /// 本物の TMCC では 16（同期語は固定なので全フレームで必ず一致する）。
+    /// 1〜15 なら「一致率高_Setだが.random」= 熱ノイズ由来の **偽ロック**。
+    /// 実測例: 良品=16、LIVEノイズ=0.38..1.00 のばらけ。
+    pub consistent_sync_bits: usize,
+}
+
+impl FrameSync {
+    /// 本物の TMCC ロックか。`alternates` と BCH の両方を通り、
+    /// 同期語が16bit一貫しているときだけ真。
+    ///
+    /// 偽ロック（ノイズから偶然の位相を選んだ場合）は `matched` 率が 60〜75% に
+    /// 張り付くが、`alternates=false` かつ BCH=NG かつ `consistent_sync_bits < 16`
+    /// なので必ずここで落ちる。
+    pub fn is_true_lock(&self) -> bool {
+        self.alternates
+            && self.bch_valid
+            && self.consistent_sync_bits == SYNC_SIZE
+            && self.matched * 100 >= self.total * 95
+    }
 }
 
 fn match_count(w: &[u8], pat: &[u8; SYNC_SIZE]) -> usize {
     w.iter().zip(pat).filter(|(a, b)| *a == *b).count()
+}
+
+/// [`match_count`] の公開版（診断 example から使う）。
+pub fn match_count_public(w: &[u8], pat: &[u8; SYNC_SIZE]) -> usize {
+    match_count(w, pat)
 }
 
 /// 204通りのフレーム位相を総当たりし、同期語一致が最大の位相を返す。
@@ -214,6 +412,8 @@ pub fn find_frame_sync(bits: &[u8]) -> Option<FrameSync> {
             total,
             parity_per_frame: parity,
             alternates,
+            bch_valid: false,
+            consistent_sync_bits: consistent_sync_bits(bits, phase),
         };
         let better = match &best {
             None => true,
@@ -228,6 +428,92 @@ pub fn find_frame_sync(bits: &[u8]) -> Option<FrameSync> {
 
 /// `phase` で揃えたあと、各ビット位置をフレーム間で多数決して1フレーム(204bit)に統合する。
 /// 情報部はフレーム間で一定なのでSNRが稼げる（同期語B1..16だけは交互なので無視してよい）。
+/// 同期語・even/odd交互・BCHを同時に評価してフレーム位相を選ぶ。
+/// 同期語一致率だけでは偶然の一致を選べるため、TMCCの独立拘束を統合する。
+pub fn find_frame_sync_joint(bits: &[u8]) -> Option<FrameSync> {
+    let mut best: Option<FrameSync> = None;
+    for phase in 0..SYMBOLS_PER_FRAME {
+        let Some(mut candidate) = find_phase_sync(bits, phase) else { continue };
+        let frame = majority_frame(bits, phase);
+        candidate.bch_valid = tmcc_bch_ok(&frame) && frame[20..204].iter().any(|&b| b != 0);
+        let quality = candidate.matched * 100
+            + usize::from(candidate.alternates) * 10_000
+            + usize::from(candidate.bch_valid) * 100_000
+            + candidate.consistent_sync_bits * 1_000;
+        let replace = match &best {
+            None => true,
+            Some(prev) => {
+                let prev_quality = prev.matched * 100
+                    + usize::from(prev.alternates) * 10_000
+                    + usize::from(prev.bch_valid) * 100_000
+                    + prev.consistent_sync_bits * 1_000;
+                quality > prev_quality
+            }
+        };
+        if replace { best = Some(candidate); }
+    }
+    best
+}
+
+fn find_phase_sync(bits: &[u8], phase: usize) -> Option<FrameSync> {
+    if bits.len() < SYMBOLS_PER_FRAME || phase + 1 + SYNC_SIZE > bits.len() { return None; }
+    let mut matched = 0usize;
+    let mut total = 0usize;
+    let mut parity = Vec::new();
+    let mut f = 0usize;
+    loop {
+        let start = phase + f * SYMBOLS_PER_FRAME;
+        if start + 1 + SYNC_SIZE > bits.len() { break; }
+        let w = &bits[start + 1..start + 1 + SYNC_SIZE];
+        let me = match_count(w, &SYNC_EVEN);
+        let mo = match_count(w, &SYNC_ODD);
+        let odd = mo > me;
+        matched += if odd { mo } else { me };
+        parity.push(odd);
+        total += SYNC_SIZE;
+        f += 1;
+    }
+    if total == 0 { return None; }
+    Some(FrameSync {
+        phase, n_frames: f, matched, total,
+        parity_per_frame: parity.clone(),
+        alternates: parity.windows(2).all(|w| w[0] != w[1]) && parity.len() >= 2,
+        bch_valid: false,
+        consistent_sync_bits: consistent_sync_bits(bits, phase),
+    })
+}
+
+/// 同期語16bitのうち、**全フレームで** 一貫して一致した位置の数。
+///
+/// 各フレームで even/odd の多い方に寄せた後、そのパターンと bit 単位で比較し、
+/// 一度も不一致にならなかった位置を数える。本物の TMCC なら 16、偽ロックなら 1〜15。
+fn consistent_sync_bits(bits: &[u8], phase: usize) -> usize {
+    let mut hit = [0usize; SYNC_SIZE];
+    let mut n = 0usize;
+    let mut f = 0usize;
+    loop {
+        let start = phase + f * SYMBOLS_PER_FRAME;
+        if start + 1 + SYNC_SIZE > bits.len() {
+            break;
+        }
+        let w = &bits[start + 1..start + 1 + SYNC_SIZE];
+        let me = match_count(w, &SYNC_EVEN);
+        let mo = match_count(w, &SYNC_ODD);
+        let pat = if mo > me { &SYNC_ODD } else { &SYNC_EVEN };
+        for i in 0..SYNC_SIZE {
+            if w[i] == pat[i] {
+                hit[i] += 1;
+            }
+        }
+        n += 1;
+        f += 1;
+    }
+    if n == 0 {
+        return 0;
+    }
+    hit.iter().filter(|&&h| h == n).count()
+}
+
 pub fn majority_frame(bits: &[u8], phase: usize) -> Vec<u8> {
     let mut frame = vec![0u8; SYMBOLS_PER_FRAME];
     for (pos, slot) in frame.iter_mut().enumerate() {
@@ -253,13 +539,91 @@ pub fn majority_frame(bits: &[u8], phase: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::equalize::SEGMENT_BIN_OFFSET;
+    use crate::params::FFT_LEN;
 
     #[test]
-    fn tmcc_local_carriers_are_in_segment() {
-        assert_eq!(TMCC_LOCAL_CARRIERS, [101, 131, 286, 349]);
-        for c in TMCC_LOCAL_CARRIERS {
-            assert!(c < 432);
+    fn equalized_dbpsk_preserves_tmcc_bits_with_channel() {
+        let bits = vec![0, 1, 1, 0, 1, 0, 0, 1];
+        let pilots = SegmentPilots::center_1seg();
+        let mut segs: Vec<Vec<Complex32>> = vec![vec![Complex32::new(0.0, 0.0); 432]; bits.len() + 1];
+        for k in 0..segs.len() {
+            for l in pilots.sp_carriers(k % 4) { segs[k][l] = Complex32::new(pilots.values[l], 0.0); }
         }
+        for &c in &TMCC_LOCAL_CARRIERS {
+            let h = Complex32::from_polar(0.8, 0.7);
+            let mut ph = Complex32::new(1.0, 0.0);
+            segs[0][c] = ph * h;
+            for (i, &bit) in bits.iter().enumerate() {
+                if bit == 1 { ph = -ph; }
+                segs[i + 1][c] = ph * h;
+            }
+        }
+        assert_eq!(equalized_dbpsk_bits(&segs), bits);
+    }
+
+    #[test]
+    fn equalized_dbpsk_uses_detected_symbol_phases() {
+        let bits = vec![0, 1, 0, 1, 1, 0];
+        let pilots = SegmentPilots::center_1seg();
+        let mut segs: Vec<Vec<Complex32>> = vec![vec![Complex32::new(0.0, 0.0); 432]; bits.len() + 1];
+        for k in 0..segs.len() {
+            for l in pilots.sp_carriers(k % 4) {
+                segs[k][l] = Complex32::new(pilots.values[l], 0.0);
+            }
+        }
+        for &c in &TMCC_LOCAL_CARRIERS {
+            let mut ph = Complex32::new(1.0, 0.0);
+            for (i, &bit) in bits.iter().enumerate() {
+                if bit == 1 { ph = -ph; }
+                segs[i + 1][c] = ph;
+            }
+        }
+        assert_eq!(equalized_dbpsk_bits_with_phases(&segs), bits);
+    }
+
+    #[test]
+    fn phase_offset_scores_prefer_the_correct_cyclic_alignment() {
+        let bits = vec![0, 1, 0, 1, 1, 0];
+        let pilots = SegmentPilots::center_1seg();
+        let mut segs: Vec<Vec<Complex32>> = vec![vec![Complex32::new(0.0, 0.0); 432]; bits.len() + 1];
+        for k in 0..segs.len() {
+            for l in pilots.sp_carriers(k % 4) {
+                segs[k][l] = Complex32::new(pilots.values[l], 0.0);
+            }
+        }
+        for &c in &TMCC_LOCAL_CARRIERS {
+            let mut ph = Complex32::new(1.0, 0.0);
+            for (i, &bit) in bits.iter().enumerate() {
+                if bit == 1 { ph = -ph; }
+                segs[i + 1][c] = ph;
+            }
+        }
+        let scores = phase_offset_scores(&segs);
+        assert_eq!(scores[0], scores[1]); // small fixture: all four are valid cyclic origins
+    }
+
+    #[test]
+    fn integer_offset_score_prefers_known_tmcc_phase_alignment() {
+        let _pilots = SegmentPilots::center_1seg();
+        let nominal = SEGMENT_BIN_OFFSET;
+        let mut spectra = vec![vec![Complex32::new(0.0, 0.0); FFT_LEN]; 2];
+        for (k, s) in spectra.iter_mut().enumerate() {
+            for (j, &c) in TMCC_LOCAL_CARRIERS.iter().enumerate() {
+                let phase = if (k + j) % 2 == 0 { 1.0 } else { -1.0 };
+                // Adjacent carriers follow the known PRBS sign relation.
+                s[nominal + c] = Complex32::new(phase, 0.0);
+            }
+        }
+        // Shift the complete active segment by three FFT bins.
+        let mut shifted = vec![vec![Complex32::new(0.0, 0.0); FFT_LEN]; 2];
+        for k in 0..spectra.len() {
+            for c in 0..432 {
+                shifted[k][nominal + c + 3] = spectra[k][nominal + c];
+            }
+        }
+        assert!(integer_offset_score(&spectra, nominal) > integer_offset_score(&shifted, nominal));
+        assert_eq!(estimate_integer_offset(&shifted, nominal, 8), Some(nominal + 3));
     }
 
     #[test]
@@ -267,6 +631,83 @@ mod tests {
         for i in 0..SYNC_SIZE {
             assert_eq!(SYNC_EVEN[i] ^ SYNC_ODD[i], 1);
         }
+    }
+
+    #[test]
+    fn parse_tmcc_uses_gr_isdbt_bit_positions() {
+        let mut frame = vec![0u8; SYMBOLS_PER_FRAME];
+        frame[1..1 + SYNC_SIZE].copy_from_slice(&SYNC_EVEN);
+        // B20..B27 control, then Layer A/B/C at the gr-isdbt positions.
+        frame[20] = 0;
+        frame[21] = 1; // system id
+        frame[22..26].copy_from_slice(&[0, 0, 1, 0]); // switching indicator
+        frame[26] = 0;
+        frame[27] = 1; // partial reception
+        for (i, v) in [0b001u8, 0b001, 0b011].into_iter().flat_map(|x| (0..3).map(move |b| (x >> (2 - b)) & 1)).enumerate() {
+            frame[28 + i] = v;
+        }
+        frame[37..41].copy_from_slice(&[0, 0, 0, 1]);
+        let info = parse_tmcc(&frame);
+        assert_eq!(info.system_id, 1);
+        assert_eq!(info.switching_indicator, 0b0010);
+        assert_eq!(info.partial_reception, 1);
+        assert_eq!(info.layer_a.modulation, Modulation::Qpsk);
+        assert_eq!(coding_rate_str(info.layer_a.coding_rate), "2/3");
+        assert_eq!(interleaving_mode3(info.layer_a.interleaving), Some(4));
+        assert_eq!(info.layer_a.n_segments, 1);
+    }
+
+    #[test]
+    fn joint_frame_sync_prefers_valid_bch_and_alternating_frames() {
+        let mut frames = vec![0u8; SYMBOLS_PER_FRAME * 3];
+        for f in 0..3 {
+            let mut fr = vec![0u8; SYMBOLS_PER_FRAME];
+            fr[1..1 + SYNC_SIZE].copy_from_slice(if f % 2 == 0 { &SYNC_EVEN } else { &SYNC_ODD });
+            frames[f * SYMBOLS_PER_FRAME..(f + 1) * SYMBOLS_PER_FRAME].copy_from_slice(&fr);
+        }
+        let fs = find_frame_sync_joint(&frames).expect("joint sync");
+        assert_eq!(fs.phase, 0);
+        assert!(fs.alternates);
+    }
+
+    /// 熱ノイズ由来の **偽ロック**（同期語一致率 60〜75% に張り付く）を弾く。
+    ///
+    /// 実測: 良品 IQ は同期語16bitが全フレームで一貫（16/16）し、真のロックと判定される。
+    /// 一方、ノイズだけの IQ は一致率が約70%でも16bit中3bitしか一貫しない（3/16）ため、
+    /// `is_true_lock()` が false になる。どちらの matched 率も似ていて区別できない。
+    #[test]
+    fn true_lock_requires_all_sixteen_sync_bits_consistent() {
+        // (1) 本物相当: 同期語が完全固定 → 一貫16bit
+        let mut real = vec![0u8; SYMBOLS_PER_FRAME * 8];
+        for f in 0..8 {
+            let fr = &mut real[f * SYMBOLS_PER_FRAME..(f + 1) * SYMBOLS_PER_FRAME];
+            fr[1..1 + SYNC_SIZE].copy_from_slice(if f % 2 == 0 { &SYNC_EVEN } else { &SYNC_ODD });
+        }
+        let fs_real = find_frame_sync_joint(&real).expect("real sync");
+        assert_eq!(fs_real.consistent_sync_bits, SYNC_SIZE);
+        assert_eq!(fs_real.matched * 100, fs_real.total * 100);
+
+        // (2) 偽ロック相当: 毎フレームの同期語位置がランダムに数ビット化ける
+        //     → 平均一致率は60〜75%に張り付くが、一貫するビットは数個しかない
+        let mut noise = vec![0u8; SYMBOLS_PER_FRAME * 8];
+        let mut seed = 0x1234_5678u32;
+        for f in 0..8 {
+            let fr = &mut noise[f * SYMBOLS_PER_FRAME..(f + 1) * SYMBOLS_PER_FRAME];
+            fr[1..1 + SYNC_SIZE].copy_from_slice(if f % 2 == 0 { &SYNC_EVEN } else { &SYNC_ODD });
+            // 3ビットをランダムに反転（1フレームあたり）
+            for _ in 0..3 {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let idx = 1 + (seed >> 16) as usize % SYNC_SIZE;
+                fr[idx] ^= 1;
+            }
+        }
+        let fs_noise = find_frame_sync_joint(&noise).expect("noise sync");
+        assert!(
+            fs_noise.consistent_sync_bits < SYNC_SIZE,
+            "偽ロック入力で16bit全部が一致してはいけない（実際 {}）",
+            fs_noise.consistent_sync_bits
+        );
+        assert!(!fs_noise.is_true_lock(), "偽ロックを真のロックと判定してはいけない");
     }
 
     /// 既知TMCCフレームをDBPSK変調 → 復号 → 同期 → パースの往復。

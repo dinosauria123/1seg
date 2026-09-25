@@ -73,6 +73,98 @@ impl OfdmDemod {
         out
     }
 
+    /// シンボルごとにCP相関で境界を微調整する復調。
+    /// サンプリング周波数誤差による長時間のtiming driftを追跡する。
+    pub fn demod_stream_tracked(
+        &self,
+        r: &[Complex32],
+        symbol_start: usize,
+        gi: GuardInterval,
+        cfo_subcarriers: f32,
+        max_symbols: usize,
+        search_radius: usize,
+    ) -> Vec<Vec<Complex32>> {
+        let n = self.n;
+        let l = gi.cp_len(n);
+        let sym = n + l;
+        let radius = search_radius.min(16);
+        let mut out = Vec::new();
+        let mut expected = symbol_start;
+        let mut buf = vec![Complex32::new(0.0, 0.0); n];
+        while out.len() < max_symbols && expected + sym <= r.len() {
+            let lo = expected.saturating_sub(radius);
+            let hi = (expected + sym + radius).min(r.len());
+            if hi <= lo + sym || hi - lo < n + l {
+                break;
+            }
+            let window = &r[lo..hi];
+            let refined = crate::sync::estimate_symbol_sync(window, n, gi);
+            let start = refined
+                .filter(|e| e.metric > 0.2)
+                .map(|e| lo + e.symbol_start)
+                .unwrap_or(expected);
+            if start + sym > r.len() { break; }
+            let base = start + l;
+            for k in 0..n {
+                let m = base + k;
+                let ph = -2.0 * PI * cfo_subcarriers * (m as f32) / (n as f32);
+                buf[k] = r[m] * Complex32::from_polar(1.0, ph);
+            }
+            self.fft.process(&mut buf);
+            let half = n / 2;
+            let scale = 1.0 / (n as f32).sqrt();
+            let mut spec = vec![Complex32::new(0.0, 0.0); n];
+            for k in 0..n { spec[(k + half) % n] = buf[k] * scale; }
+            out.push(spec);
+            expected = start + sym;
+        }
+        out
+    }
+
+    /// 1シンボルを復調しつつ、次のシンボル境界をCP相関で更新する。
+    /// 返り値は `(spectrum, 次のシンボル開始位置)`。
+    pub fn demod_one_tracked(
+        &self,
+        r: &[Complex32],
+        expected: usize,
+        gi: GuardInterval,
+        cfo_subcarriers: f32,
+        radius: usize,
+    ) -> Option<(Vec<Complex32>, usize)> {
+        let n = self.n;
+        let l = gi.cp_len(n);
+        let sym = n + l;
+        let radius = radius.min(16);
+        if expected + sym + radius > r.len() {
+            return None;
+        }
+        let lo = expected.saturating_sub(radius);
+        let hi = (expected + sym + radius).min(r.len());
+        let start = crate::sync::estimate_symbol_sync(&r[lo..hi], n, gi)
+            .filter(|e| e.metric > 0.2)
+            .map(|e| lo + e.symbol_start)
+            .unwrap_or(expected);
+        if start + sym > r.len() {
+            return None;
+        }
+        let base = start + l;
+        let mut buf = vec![Complex32::new(0.0, 0.0); n];
+        let w = Complex32::from_polar(1.0, -2.0 * PI * cfo_subcarriers / (n as f32));
+        let mut ph = Complex32::new(1.0, 0.0);
+        for k in 0..n {
+            buf[k] = r[base + k] * ph;
+            ph *= w;
+        }
+        self.fft.process(&mut buf);
+        let half = n / 2;
+        let scale = 1.0 / (n as f32).sqrt();
+        let mut spec = vec![Complex32::new(0.0, 0.0); n];
+        for k in 0..n {
+            spec[(k + half) % n] = buf[k] * scale;
+        }
+        Some((spec, start + sym))
+    }
+
     /// 1シンボルだけ復調（ストリーミング/逐次処理用）。`r[sym_start ..]` から
     /// CPを飛ばして有効N点をFFT・fftshift。CFO位相は**シンボルローカル**（m=0..N）で、
     /// シンボル間の定数位相差は後段の[`crate::equalize`]（SPで毎シンボルH推定）が吸収する。

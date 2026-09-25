@@ -116,7 +116,50 @@ pub fn sp_coherence(seg: &[Complex32], sym_mod4: usize, pilots: &SegmentPilots) 
     }
 }
 
-/// SPコヒーレンス最大の `symbol%4` を返す（値とコヒーレンス）。
+/// gr-isdbtの方式に寄ったSP位相スコア。
+/// 候補位相の各SP隣接対について、受信値の積に既知PRBSの符号関係を掛ける。
+pub fn phase_scores_gr_isdbt(seg: &[Complex32], pilots: &SegmentPilots) -> [f32; 4] {
+    let mut out = [0.0f32; 4];
+    for p in 0..4 {
+        let sp: Vec<usize> = pilots.sp_carriers(p).collect();
+        let mut num = Complex32::new(0.0, 0.0);
+        for pair in sp.windows(2) {
+            let a = seg[pair[0]];
+            let b = seg[pair[1]];
+            let sign = if pilots.values[pair[0]] == pilots.values[pair[1]] { 1.0 } else { -1.0 };
+            num += Complex32::new(sign, 0.0) * (b * a.conj());
+        }
+        out[p] = num.norm();
+    }
+    out
+}
+
+pub fn phase_scores(seg: &[Complex32], pilots: &SegmentPilots) -> [f32; 4] {
+    [
+        sp_coherence(seg, 0, pilots),
+        sp_coherence(seg, 1, pilots),
+        sp_coherence(seg, 2, pilots),
+        sp_coherence(seg, 3, pilots),
+    ]
+}
+
+/// 追従推定: SP位相は `symbol % 4` なので、前記号から次記号への
+/// 遷移 `(p+1)%4` を弱い拘束として使い、SPスコアが曖昧な記号を安定させる。
+pub fn track_symbol_phases(scores: &[[f32; 4]]) -> Vec<usize> {
+    if scores.is_empty() { return Vec::new(); }
+    let mut out: Vec<usize> = scores.iter().map(|r| {
+        r.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0
+    }).collect();
+    for i in 1..out.len() {
+        let expected = (out[i - 1] + 1) % 4;
+        if out[i] != expected && scores[i][expected] + 1e-4 >= scores[i][out[i]] {
+            out[i] = expected;
+        }
+    }
+    out
+}
+
+
 pub fn detect_symbol_phase(seg: &[Complex32], pilots: &SegmentPilots) -> (usize, f32) {
     (0..4)
         .map(|p| (p, sp_coherence(seg, p, pilots)))
@@ -128,6 +171,60 @@ pub fn detect_symbol_phase(seg: &[Complex32], pilots: &SegmentPilots) -> (usize,
 mod tests {
     use super::*;
     use crate::pilots::SegmentPilots;
+
+    #[test]
+    fn tracked_phase_follows_periodic_transition_under_ambiguous_scores() {
+        let scores = vec![[0.30, 0.29, 0.10, 0.05], [0.29, 0.30, 0.05, 0.04], [0.05, 0.04, 0.30, 0.29], [0.04, 0.05, 0.29, 0.30]];
+        assert_eq!(track_symbol_phases(&scores), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn gr_isdbt_phase_score_uses_unnormalized_correlation_magnitude() {
+        let pilots = SegmentPilots::center_1seg();
+        let mut weak = vec![Complex32::new(0.0, 0.0); SEGMENT_CARRIERS];
+        let mut strong = weak.clone();
+        for p in 0..4 {
+            for &l in pilots.sp_carriers(p).collect::<Vec<_>>().iter().skip(1) {
+                let a = l - 12;
+                weak[l] = Complex32::new(0.1 * pilots.values[l], 0.0);
+                weak[a] = Complex32::new(0.1 * pilots.values[a], 0.0);
+                strong[l] = Complex32::new(pilots.values[l], 0.0);
+                strong[a] = Complex32::new(pilots.values[a], 0.0);
+            }
+        }
+        let ws = phase_scores_gr_isdbt(&weak, &pilots);
+        let ss = phase_scores_gr_isdbt(&strong, &pilots);
+        assert!(ss[0] > ws[0] * 10.0);
+    }
+
+    #[test]
+    fn gr_isdbt_style_phase_score_uses_known_prbs_relation() {
+        let pilots = SegmentPilots::center_1seg();
+        let mut seg = vec![Complex32::new(0.0, 0.0); SEGMENT_CARRIERS];
+        for p in 0..1 {
+            for &l in pilots.sp_carriers(p).collect::<Vec<_>>().iter().skip(1) {
+                let prev = l - 12;
+                seg[l] = Complex32::new(pilots.values[l], 0.0);
+                seg[prev] = Complex32::new(pilots.values[prev], 0.0);
+            }
+        }
+        let scores = phase_scores_gr_isdbt(&seg, &pilots);
+        assert!(scores[0] > 0.99);
+    }
+
+    #[test]
+    fn phase_scores_rank_the_injected_sp_phase_first() {
+        let pilots = SegmentPilots::center_1seg();
+        let mut seg = vec![Complex32::new(0.2, 0.1); SEGMENT_CARRIERS];
+        for l in pilots.sp_carriers(2) {
+            seg[l] = Complex32::new(pilots.values[l], 0.0);
+        }
+        let scores = phase_scores(&seg, &pilots);
+        assert_eq!(detect_symbol_phase(&seg, &pilots).0, 2);
+        assert!(scores[2] > scores[0]);
+        assert!(scores[2] > scores[1]);
+        assert!(scores[2] > scores[3]);
+    }
 
     #[test]
     fn segment_bin_offset_is_296() {

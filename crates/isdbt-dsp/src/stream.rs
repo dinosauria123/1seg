@@ -8,19 +8,22 @@ use crate::deinterleave::{data_carrier_indices, freq_deinterleave, TimeDeinterle
 use crate::demap::{qpsk_soft, BitDeinterleaverQpsk};
 use crate::demod::OfdmDemod;
 use crate::equalize::{
-    detect_symbol_phase, equalize, estimate_channel, extract_segment, SEGMENT_BIN_OFFSET,
+    detect_symbol_phase, equalize, estimate_channel, extract_segment,
+    phase_scores_gr_isdbt, track_symbol_phases,
 };
 use crate::iq::u8_iq_to_complex;
 use crate::params::{GuardInterval, FFT_LEN};
 use crate::pilots::SegmentPilots;
 use crate::rs;
-use crate::sync::estimate_sync;
+use crate::sync::estimate_symbol_sync;
 use crate::ts::{best_sync_phase, pack_bits_msb, ByteDeinterleaver, EnergyPrbs, BI_I, BI_M, TSP};
 use crate::viterbi::{depuncture, Viterbi, ViterbiStreaming, PUNCTURE_2_3};
 use num_complex::Complex32;
 
 const RESET_PERIOD: usize = 64; // 1 OFDMフレーム = 64 RSブロック
 const PRBS_INIT: u16 = 0xa9;
+/// bin offset 探索半径。capture ごとに数 bin のズレが出るので TMCC 同期で決める。
+const OFFSET_RADIUS: usize = 16;
 const TB_DEPTH: usize = 96;
 const BYTE_LATENCY: usize = BI_M * BI_I * (BI_I - 1);
 const LOCK_SYMS: usize = 4000;
@@ -28,24 +31,68 @@ const COMPACT_AT: usize = 8 * 1024 * 1024;
 // 1回の feed/pump で処理する最大シンボル数（≈50msぶん）。呼び出し側が描画を挟めるように分割。
 const MAX_SYMS_PER_CALL: usize = 64;
 
+
+struct RsBlockAssembler {
+    buffer: Vec<u8>,
+    phase: usize,
+    reset_off: usize,
+    prbs: EnergyPrbs,
+    block_idx: usize,
+}
+
+impl RsBlockAssembler {
+    fn new(phase: usize, reset_off: usize) -> Self {
+        Self { buffer: Vec::with_capacity(TSP), phase, reset_off, prbs: EnergyPrbs::with_init(PRBS_INIT), block_idx: 0 }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+        self.buffer.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        while self.buffer.len() >= TSP + self.phase {
+            if self.block_idx % RESET_PERIOD == self.reset_off {
+                self.prbs.reset_to(PRBS_INIT);
+            }
+            let start = self.phase;
+            let mut ds = Vec::with_capacity(TSP);
+            ds.push(self.buffer[start]);
+            for &b in &self.buffer[start + 1..start + TSP] {
+                ds.push(b ^ (self.prbs.clock(8) as u8));
+            }
+            self.prbs.clock(8);
+            self.block_idx += 1;
+            if let Some(cw) = rs::decode(&ds) { out.push(cw); }
+            self.buffer.drain(0..start + TSP);
+        }
+        out
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Locked {
     gi: GuardInterval,
     cfo: f32,
     sym: usize,
     phase0: usize,
+    /// TMCC 同期一致率で確定した1segセグメントの bin offset。
+    seg_off: usize,
 }
 
 /// 初期バッファをバッチ処理して整列パラメータを確定。
-fn lock_params(specs: &[Vec<Complex32>], phase0: usize) -> Option<(usize, usize, usize)> {
+fn lock_params(specs: &[Vec<Complex32>], phase0: usize, seg_off: usize) -> Option<(usize, usize, usize)> {
     let pilots = SegmentPilots::center_1seg();
+    let mut phase_rows: Vec<[f32; 4]> = specs
+        .iter()
+        .map(|sp| phase_scores_gr_isdbt(&sp[seg_off..seg_off + 432], &pilots))
+        .collect();
+    let phases = track_symbol_phases(&phase_rows);
+    let phase0 = phases.first().copied().unwrap_or(0);
     let mut tdi = TimeDeinterleaver::new(4);
     let mut bdi = BitDeinterleaverQpsk::new();
     let warmup = tdi.latency() + bdi.latency();
     let mut coded: Vec<f32> = Vec::new();
     for (k, sp) in specs.iter().enumerate() {
-        let sym_mod4 = (phase0 + k) % 4;
-        let seg = extract_segment(sp, SEGMENT_BIN_OFFSET);
+        let sym_mod4 = phases.get(k).copied().unwrap_or((phase0 + k) % 4);
+        let seg = extract_segment(sp, seg_off);
         let h = estimate_channel(&seg, sym_mod4, &pilots);
         let eq = equalize(&seg, &h);
         let data: Vec<Complex32> = data_carrier_indices(sym_mod4, &pilots)
@@ -66,7 +113,10 @@ fn lock_params(specs: &[Vec<Complex32>], phase0: usize) -> Option<(usize, usize,
     let bytes = pack_bits_msb(&bits, 0);
     let checker = rs::Checker::new();
     let mut best = (0.0f32, 0usize, 0usize, 0usize);
-    for c in 0..BI_I {
+    if bytes.is_empty() {
+        return None;
+    }
+    for c in 0..BI_I.min(bytes.len()) {
         let mut di = ByteDeinterleaver::new();
         let stream: Vec<u8> = bytes[c..]
             .iter()
@@ -123,6 +173,7 @@ struct Pipe {
     commutator: usize,
     reset_off: usize,
     block_phase: usize,
+    rs_asm: RsBlockAssembler,
     mother: Vec<f32>,
     bit_acc: u8,
     bit_cnt: usize,
@@ -132,9 +183,10 @@ struct Pipe {
     block_idx: usize,
     ndec: usize,
     nblk: usize,
+    seg_off: usize,
 }
 impl Pipe {
-    fn new(commutator: usize, reset_off: usize, block_phase: usize) -> Self {
+    fn new(commutator: usize, reset_off: usize, block_phase: usize, seg_off: usize) -> Self {
         Self {
             pilots: SegmentPilots::center_1seg(),
             tdi: TimeDeinterleaver::new(4),
@@ -146,15 +198,17 @@ impl Pipe {
             commutator,
             reset_off,
             block_phase,
+            rs_asm: RsBlockAssembler::new(0, reset_off),
             mother: Vec::new(),
             bit_acc: 0,
             bit_cnt: 0,
             byte_in_idx: 0,
             deint_out_idx: 0,
-            block_buf: Vec::with_capacity(TSP),
+            block_buf: Vec::with_capacity(TSP + 2),
             block_idx: 0,
             ndec: 0,
             nblk: 0,
+            seg_off,
         }
     }
     fn warmup(&self) -> usize {
@@ -163,7 +217,7 @@ impl Pipe {
 
     fn process(&mut self, spec: &[Complex32], phase0: usize, k: usize, out: &mut Vec<u8>) {
         let sym_mod4 = (phase0 + k) % 4;
-        let seg = extract_segment(spec, SEGMENT_BIN_OFFSET);
+        let seg = extract_segment(spec, self.seg_off);
         let h = estimate_channel(&seg, sym_mod4, &self.pilots);
         let eq = equalize(&seg, &h);
         let data: Vec<Complex32> = data_carrier_indices(sym_mod4, &self.pilots)
@@ -220,26 +274,11 @@ impl Pipe {
                 continue;
             }
             self.deint_out_idx += 1;
-            self.block_buf.push(o);
-            if self.block_buf.len() < TSP {
-                continue;
-            }
-            if self.block_idx % RESET_PERIOD == self.reset_off {
-                self.prbs.reset_to(PRBS_INIT);
-            }
-            let mut ds = Vec::with_capacity(TSP);
-            ds.push(self.block_buf[0]);
-            for &x in &self.block_buf[1..TSP] {
-                ds.push(x ^ (self.prbs.clock(8) as u8));
-            }
-            self.prbs.clock(8);
-            self.block_idx += 1;
-            self.nblk += 1;
-            if let Some(cw) = rs::decode(&ds) {
-                out.extend_from_slice(&cw[..188]);
+            for cw in self.rs_asm.feed(&[o]) {
+                self.nblk += 1;
                 self.ndec += 1;
+                out.extend_from_slice(&cw[..rs::K]);
             }
-            self.block_buf.clear();
         }
         self.mother.drain(0..pairs * 2);
     }
@@ -322,7 +361,11 @@ impl StreamingDecoder {
             self.dc_done = true;
         }
         let off = (self.buf.len() / 10).min(50_000);
-        let est = match estimate_sync(&self.buf[off..], FFT_LEN) {
+        let est = match estimate_symbol_sync(
+            &self.buf[off..(off + 1_000_000).min(self.buf.len())],
+            FFT_LEN,
+            GuardInterval::G1_8,
+        ) {
             Some(e) => e,
             None => return, // データを増やして再試行
         };
@@ -334,14 +377,28 @@ impl StreamingDecoder {
         if navail < 200 {
             return;
         }
+        // bin offset は capture ごとにズレるので、TMCC フレーム同期一致率で決める。
+        // 固定値（308等）で当てると bin ズレにより符号部が全滅して RS 0% になる。
+        let probe: Vec<Vec<Complex32>> = self
+            .demod
+            .demod_stream_tracked(&self.buf, 0, est.guard, est.cfo_subcarriers, navail, 8);
+        let Some((seg_off, sync, known)) = crate::tmcc::select_segment_offset(&probe, OFFSET_RADIUS)
+        else {
+            eprintln!("offset 探索失敗（スペクトル長不足）");
+            return;
+        };
+        if sync < 0.95 {
+            eprintln!("offset={seg_off} だが TMCC 同期一致 {sync:.3} が低い（偽ロック疑い）: 戻す");
+            return;
+        }
+        eprintln!("bin offset={seg_off} (nominal {}) TMCC同期={sync:.3} known={known:.3}", crate::equalize::SEGMENT_BIN_OFFSET);
+        let specs = probe;
         let (phase0, _) = detect_symbol_phase(
-            &extract_segment(&self.demod.demod_one(&self.buf, 0, est.guard, est.cfo_subcarriers), SEGMENT_BIN_OFFSET),
+            &extract_segment(&specs[0], seg_off),
             &SegmentPilots::center_1seg(),
         );
-        let specs: Vec<Vec<Complex32>> = (0..navail)
-            .map(|k| self.demod.demod_one(&self.buf, k * sym, est.guard, est.cfo_subcarriers))
-            .collect();
-        let Some((commutator, reset_off, block_phase)) = lock_params(&specs, phase0) else {
+        let Some((commutator, reset_off, block_phase)) = lock_params(&specs, phase0, seg_off) else {
+            eprintln!("ロック失敗: navail={} specs={} phase0={}", navail, specs.len(), phase0);
             return; // ロック失敗（品質）。増データで再試行
         };
         self.locked = Some(Locked {
@@ -349,8 +406,9 @@ impl StreamingDecoder {
             cfo: est.cfo_subcarriers,
             sym,
             phase0,
+            seg_off,
         });
-        self.pipe = Some(Pipe::new(commutator, reset_off, block_phase));
+        self.pipe = Some(Pipe::new(commutator, reset_off, block_phase, seg_off));
         // ライブ：溜まったバックログを捨ててライブエッジ付近から復号（音声が映像に遅れないよう）。
         // 整列（PRBS周期・OFDMフレーム・phase0・バイト整列）を壊さないため、
         // 1フレーム=204シンボル単位で捨てる（204%4=0, 64RSブロック=PRBS1周期）。
@@ -411,12 +469,20 @@ impl StreamingDecoder {
         if let Some(lk) = self.locked {
             let mut n = 0;
             while self.cur + lk.sym <= self.buf.len() && n < max {
-                let spec = self.demod.demod_one(&self.buf, self.cur, lk.gi, lk.cfo);
+                let Some((spec, next)) = self.demod.demod_one_tracked(
+                    &self.buf,
+                    self.cur,
+                    lk.gi,
+                    lk.cfo,
+                    8,
+                ) else {
+                    break;
+                };
                 self.pipe
                     .as_mut()
                     .unwrap()
                     .process(&spec, lk.phase0, self.k, &mut out);
-                self.cur += lk.sym;
+                self.cur = next;
                 self.k += 1;
                 n += 1;
                 if self.cur >= COMPACT_AT {
@@ -428,3 +494,27 @@ impl StreamingDecoder {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rs::encode;
+    #[test]
+    fn rs_assembler_decodes_two_consecutive_blocks() {
+        let mut a = RsBlockAssembler::new(0, 0);
+        let cw1 = encode(&[0x11; rs::K]);
+        let cw2 = encode(&[0x22; rs::K]);
+        let mut prbs = EnergyPrbs::with_init(PRBS_INIT);
+        let mut raw = Vec::new();
+        for cw in [&cw1, &cw2] {
+            raw.push(cw[0]);
+            for &b in &cw[1..] { raw.push(b ^ (prbs.clock(8) as u8)); }
+            prbs.clock(8);
+        }
+        let out = a.feed(&raw);
+        assert_eq!(out.len(), 2);
+        assert_eq!(&out[0][..2], &[0x11, 0x11]);
+        assert_eq!(&out[1][..2], &[0x22, 0x22]);
+    }
+}
+

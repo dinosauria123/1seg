@@ -18,6 +18,7 @@ pub mod demap;
 pub mod demod;
 pub mod equalize;
 pub mod iq;
+pub mod latm;
 pub mod params;
 pub mod pilots;
 pub mod stream;
@@ -35,8 +36,8 @@ pub use demap::{qpsk_soft, BitDeinterleaverQpsk};
 pub use demod::OfdmDemod;
 pub use viterbi::{conv_encode, conv_encode_terminated, depuncture, hard_to_soft, puncture, Viterbi, ViterbiStreaming};
 pub use equalize::{
-    detect_symbol_phase, equalize, estimate_channel, extract_segment, sp_coherence,
-    SEGMENT_BIN_OFFSET,
+    detect_symbol_phase, equalize, estimate_channel, extract_segment, phase_scores, phase_scores_gr_isdbt,
+    sp_coherence, track_symbol_phases, SEGMENT_BIN_OFFSET,
 };
 pub use params::{GuardInterval, CARRIER_SPACING_HZ, FFT_LEN, SAMPLE_RATE_HZ};
 pub use pilots::{SegmentPilots, CENTER_SEGMENT_OFFSET, SEGMENT_CARRIERS};
@@ -46,6 +47,7 @@ pub use sync::{
     periodicity_score, SyncEstimate,
 };
 pub use tmcc::{
-    coding_rate_str, dbpsk_bits, find_frame_sync, interleaving_mode3, majority_frame, parse_tmcc,
+    coding_rate_str, dbpsk_bits, equalized_dbpsk_bits, estimate_integer_offset, find_frame_sync,
+    integer_offset_score, interleaving_mode3, majority_frame, parse_tmcc, select_segment_offset,
     FrameSync, LayerInfo, Modulation, TmccInfo, SYMBOLS_PER_FRAME, TMCC_LOCAL_CARRIERS,
 };

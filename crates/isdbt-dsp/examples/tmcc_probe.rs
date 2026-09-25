@@ -8,12 +8,12 @@
 //! ```
 
 use isdbt_dsp::demod::OfdmDemod;
-use isdbt_dsp::equalize::{extract_segment, SEGMENT_BIN_OFFSET};
+use isdbt_dsp::equalize::SEGMENT_BIN_OFFSET;
 use isdbt_dsp::iq::u8_iq_to_complex;
-use isdbt_dsp::params::FFT_LEN;
-use isdbt_dsp::sync::estimate_sync;
+use isdbt_dsp::params::{FFT_LEN, GuardInterval};
 use isdbt_dsp::tmcc::{
-    coding_rate_str, dbpsk_bits, find_frame_sync, interleaving_mode3, majority_frame, parse_tmcc,
+    coding_rate_str, equalized_dbpsk_bits, integer_offset_score,
+    interleaving_mode3, majority_frame, parse_tmcc, phase_offset_scores, find_frame_sync_joint, tmcc_bch_ok,
     LayerInfo, SYMBOLS_PER_FRAME,
 };
 use num_complex::Complex32;
@@ -47,7 +47,9 @@ fn main() {
     let off = (s.len() / 10).min(50_000);
     let seg_sig = &s[off..];
 
-    let est = estimate_sync(seg_sig, FFT_LEN).expect("同期できない");
+    // Japanese 1seg uses GI 1/8. Do not let the periodicity heuristic select
+    // a false 1/32 peak on a real capture.
+    let est = isdbt_dsp::sync::estimate_symbol_sync(seg_sig, FFT_LEN, GuardInterval::G1_8).expect("同期できない");
     eprintln!(
         "② sync: start={} gi={:?} metric={:.3} cfo={:.1}Hz",
         est.symbol_start,
@@ -57,17 +59,43 @@ fn main() {
     );
 
     let demod = OfdmDemod::new(FFT_LEN);
-    let specs = demod.demod_stream(
+    let specs = demod.demod_stream_tracked(
         seg_sig,
         est.symbol_start,
         est.guard,
         est.cfo_subcarriers,
         nsym,
+        8,
     );
+    // gr-isdbt estimates residual integer CFO from known TMCC pilot phase.
+    // This search is independent of the decoded TMCC data bits.
+    let mut best_offset = SEGMENT_BIN_OFFSET;
+    let mut best_score = -1.0f32;
+    let mut best_sync = 0.0f32;
+    for off in (SEGMENT_BIN_OFFSET.saturating_sub(16)..SEGMENT_BIN_OFFSET+17).rev() {
+        if off + 432 > FFT_LEN { continue; }
+        let candidate_segs: Vec<Vec<Complex32>> = specs.iter().map(|sp| sp[off..off + 432].to_vec()).collect();
+        let candidate_bits = equalized_dbpsk_bits(&candidate_segs);
+        let candidate_sync = find_frame_sync_joint(&candidate_bits).map(|s| s.matched as f32 / s.total as f32).unwrap_or(0.0);
+        let known = integer_offset_score(&specs, off);
+        // TMCC sync is the primary objective; known-carrier score breaks ties.
+        let score = candidate_sync * 1000.0 + known;
+        if score > best_score {
+            best_score = score;
+            best_offset = off;
+            best_sync = candidate_sync;
+        }
+        eprintln!("   candidate offset {off}: sync={:.3} known={:.3} combined={:.3}", candidate_sync, known, score);
+    }
+    let best_offset = best_offset;
+    eprintln!("② TMCC候補offset選択: offset={} (nominal {}) sync={:.3} combined={:.3}", best_offset, SEGMENT_BIN_OFFSET, best_sync, best_score);
+
     let segs: Vec<Vec<Complex32>> = specs
         .iter()
-        .map(|sp| extract_segment(sp, SEGMENT_BIN_OFFSET))
+        .map(|sp| sp[best_offset..best_offset + 432].to_vec())
         .collect();
+    let phase_scores = phase_offset_scores(&segs);
+    println!("TMCC 巡回origin別 同期一致率: {:.3} {:.3} {:.3} {:.3}", phase_scores[0], phase_scores[1], phase_scores[2], phase_scores[3]);
     eprintln!(
         "復調 {} シンボル（≈{:.1} フレーム）",
         segs.len(),
@@ -75,8 +103,8 @@ fn main() {
     );
 
     // TMCC：DBPSK復号 → フレーム同期
-    let bits = dbpsk_bits(&segs);
-    let fsync = find_frame_sync(&bits).expect("フレーム同期できるビット数がない");
+    let bits = equalized_dbpsk_bits(&segs);
+    let fsync = find_frame_sync_joint(&bits).expect("フレーム同期できるビット数がない");
 
     println!("\n=== ④ TMCC フレーム同期 ===");
     println!("フレーム位相(B0位置) : {}", fsync.phase);
@@ -98,15 +126,26 @@ fn main() {
     );
     println!(
         "判定                  : {}",
-        if fsync.alternates && fsync.matched * 100 >= fsync.total * 90 {
-            "✅ TMCCロック（同期語が偶奇交互＝フレーム整合の強い証拠）"
+        if fsync.is_true_lock() {
+            "✅ TMCCロック（16bit同期語が一貫＋偶奇交互＋BCH OK）".to_string()
+        } else if fsync.consistent_sync_bits < 16 {
+            format!(
+                "❌ 偽ロック（同期語16bit中 {}bitしか一貫しない＝熱ノイズ由来。1seg信号なし）",
+                fsync.consistent_sync_bits
+            )
+        } else if !fsync.alternates {
+            "△ 同期弱い（even/oddが交互でない＝フレーム整合なし）".to_string()
         } else {
-            "△ 同期弱い（C/N不足の可能性）"
+            "△ 同期弱い（C/N不足の可能性）".to_string()
         }
     );
+    println!("同期語一貫ビット      : {}/16", fsync.consistent_sync_bits);
+    println!("真のロックか          : {}", if fsync.is_true_lock() { "YES" } else { "NO" });
 
     // 情報部をフレーム間多数決で統合してパース
     let frame = majority_frame(&bits, fsync.phase);
+    println!("BCH(273,191)検査     : {}", if tmcc_bch_ok(&frame) { "OK" } else { "NG" });
+    println!("多数決フレーム bit数 : {} ones / 204", frame.iter().filter(|&&b| b != 0).count());
     let info = parse_tmcc(&frame);
 
     println!("\n=== TMCC 伝送パラメータ ===");

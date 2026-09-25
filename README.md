@@ -55,6 +55,18 @@ Rust実装 → 実電波で**H.264映像まで復号**（バッチ `decode` / �
 cargo test -p isdbt-dsp
 ```
 
+## 使い方・動作仕様
+
+使用上の詳細（受信可否の判定・落とし穴・診断ツール一覧）は
+[docs/OPERATION.md](docs/OPERATION.md) を参照。
+
+特に注意すべき点が一つ: **TMCC 同期語の一致率 60〜75%（特に 68.8% = 11/16）は
+「信号が弱い」ではなく熱ノイズ由来の偽ロック**です。`FrameSync::is_true_lock()`
+（16bit同期語が全フレームで一貫＋even/odd交互＋BCH OK＋一致率95%以上）で真偽を
+判定し、`lock_search` example が「偽ロック」「本物のロック」を明示します。偽ロックは
+復調器の調整では直りません（信号が無いため）。`tmcc_probe` / `lock_search` /
+`tmcc_bitdump` の順で受信状態を確かめてから再生してください。
+
 ## ハードを動かす（母艦：Ubuntu 26.04 で確認済み）
 
 ```bash
