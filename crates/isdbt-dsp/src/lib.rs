@@ -16,11 +16,13 @@
 pub mod deinterleave;
 pub mod demap;
 pub mod demod;
+pub mod demod_block;
 pub mod equalize;
 pub mod iq;
 pub mod latm;
 pub mod params;
 pub mod pilots;
+pub mod psi;
 pub mod stream;
 pub mod sync;
 pub mod viterbi;
@@ -48,6 +50,7 @@ pub use sync::{
 };
 pub use tmcc::{
     coding_rate_str, dbpsk_bits, equalized_dbpsk_bits, estimate_integer_offset, find_frame_sync,
-    integer_offset_score, interleaving_mode3, majority_frame, parse_tmcc, select_segment_offset,
+    integer_offset_score, interleaving_mode3, majority_frame, parse_tmcc, rank_segment_offsets,
+    select_segment_offset,
     FrameSync, LayerInfo, Modulation, TmccInfo, SYMBOLS_PER_FRAME, TMCC_LOCAL_CARRIERS,
 };
