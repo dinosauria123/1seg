@@ -202,9 +202,11 @@ pub struct ViterbiStreaming {
     metric: Vec<f32>,
     next: Vec<f32>, // 再利用スクラッチ（毎ステップの確保を回避）
     depth: usize,
-    /// リングバッファ（各 `depth` スロットに 各状態の生存元・入力ビット）。
-    prev: Vec<Vec<u8>>,
-    back: Vec<Vec<u8>>,
+    /// リングバッファ（各 `depth` スロットに 各状態の生存元・入力ビット）。フラット化して cache 局所性改善。
+    prev: Vec<u8>, // depth * N_STATES
+    back: Vec<u8>, // depth * N_STATES
+    /// トレースバック済み・未消費の情報ビット。
+    out: std::collections::VecDeque<u8>,
     n: usize, // 処理済みステップ数
 }
 
@@ -227,20 +229,27 @@ impl ViterbiStreaming {
             metric,
             next: vec![f32::NEG_INFINITY; N_STATES],
             depth,
-            prev: vec![vec![0u8; N_STATES]; depth],
-            back: vec![vec![0u8; N_STATES]; depth],
+            prev: vec![0u8; depth * N_STATES],
+            back: vec![0u8; depth * N_STATES],
+            out: std::collections::VecDeque::with_capacity(depth),
             n: 0,
         }
     }
 
-    /// 母符号ソフト対 `(r1, r2)` を1ステップ投入。`depth` 充填後は情報ビットを1つ返す。
+    /// 母符号ソフト対 `(r1, r2)` を1ステップ投入し、情報ビットが1つ取れたら返す。
+    ///
+    /// 1ビットごとに depth 歩のトレースバックをすると O(depth)/bit になり
+    /// K=7・depth=96 では 732us/sym（実時間 1134us/sym の65%）を消費して間に合わない。
+    /// survivor memory は depth スロットのリングなので、最良状態から一度 depth 歩
+    /// まとめて遡れば depth ビット全部が取れる。内部 FIFO が空のときだけ
+    /// （= depth ステップに1度）その一括トレースバックを行い、1ビットずつ返す。
+    /// 結果として 1ビットあたりのコストは O(1) になる。
     pub fn push(&mut self, r1: f32, r2: f32) -> Option<u8> {
         let slot = self.n % self.depth;
+        let base = slot * N_STATES;
         for m in self.next.iter_mut() {
             *m = f32::NEG_INFINITY;
         }
-        let prev_slot = &mut self.prev[slot];
-        let back_slot = &mut self.back[slot];
         for s in 0..N_STATES {
             let ms = self.metric[s];
             if ms == f32::NEG_INFINITY {
@@ -251,8 +260,8 @@ impl ViterbiStreaming {
                 let cand = ms + r1 * sx + r2 * sy;
                 if cand > self.next[ns] {
                     self.next[ns] = cand;
-                    prev_slot[ns] = s as u8;
-                    back_slot[ns] = u as u8;
+                    self.prev[base + ns] = s as u8;
+                    self.back[base + ns] = u as u8;
                 }
             }
         }
@@ -271,22 +280,29 @@ impl ViterbiStreaming {
         if self.n < self.depth {
             return None;
         }
-        // 現在の最良状態から depth 遡り、最古ステップの入力ビットを出す
-        let mut s = (0..N_STATES)
-            .max_by(|&a, &b| {
-                self.metric[a]
-                    .partial_cmp(&self.metric[b])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .unwrap() as u8;
-        let mut out = 0u8;
-        for i in 0..self.depth {
-            let step_idx = self.n - 1 - i;
-            let sl = step_idx % self.depth;
-            out = self.back[sl][s as usize];
-            s = self.prev[sl][s as usize];
+        // FIFO が空なら、直近 depth ステップを一度にトレースバックして depth ビット積む。
+        // （FIFO が空になる = 過去 depth ステップ分の出力が消費済み = 次の depth 歩分が未消費）
+        if self.out.is_empty() {
+            let mut s = (0..N_STATES)
+                .max_by(|&a, &b| {
+                    self.metric[a]
+                        .partial_cmp(&self.metric[b])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap() as usize;
+            // 新しい順（step n-1 → n-depth）に辿る。リングは depth スロット全てを
+            // 保持しているので、この depth 歩が読むスロットは上書きされていない。
+            let mut walk = vec![0u8; self.depth];
+            for i in 0..self.depth {
+                let step_idx = self.n - 1 - i;
+                let sl = (step_idx % self.depth) * N_STATES;
+                walk[i] = self.back[sl + s];
+                s = self.prev[sl + s] as usize;
+            }
+            // walk は新しい順。古い順（=出力順）に積む。
+            self.out.extend(walk.iter().rev().copied());
         }
-        Some(out)
+        self.out.pop_front()
     }
 }
 

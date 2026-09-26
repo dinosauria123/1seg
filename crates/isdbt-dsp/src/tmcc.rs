@@ -299,6 +299,49 @@ pub fn select_segment_offset(
     best
 }
 
+/// `seg_off` 候補を TMCC スコアの**降順**で上位 `top_n` 個返す。
+///
+/// `select_segment_offset()` は最良の 1 個しか返さないが、TMCC 一致度は
+/// `seg_off` の正しい objective function ではない。TMCC は 1 フレーム
+/// 204 シンボルのうち 1 シンボル分しかないため、bin offset が 1 ずれても
+/// フレーム同期を 100% 満たしたまま通ってしまう（実測 2026-09-26:
+/// `disc_test.iq` は offset 307 で TMCC 同期 1.000 だが訂正不能 31.9%、
+/// `p1.iq` は offset 308 で 0.1%）。
+///
+/// そのため候補を複数取り出し、実 RS 復.decode 成功率で選び直す
+/// （`stream::select_segment_offset_by_rs`）。同一 capture 内の比較なので
+/// 受信条件の差は打ち消される。
+///
+/// 同点は `offset` の小さい順（安定ソート）。
+pub fn rank_segment_offsets(
+    spectra: &[Vec<Complex32>],
+    search_radius: usize,
+    top_n: usize,
+) -> Vec<usize> {
+    let nominal = crate::equalize::SEGMENT_BIN_OFFSET;
+    let lo = nominal.saturating_sub(search_radius);
+    let hi = nominal + search_radius;
+    if spectra.is_empty() || hi + 432 > spectra[0].len() {
+        return Vec::new();
+    }
+    let mut scored: Vec<(usize, f32)> = Vec::new();
+    for off in lo..=hi {
+        let segs: Vec<Vec<Complex32>> = spectra
+            .iter()
+            .map(|sp| sp[off..off + 432].to_vec())
+            .collect();
+        let bits = equalized_dbpsk_bits(&segs);
+        let sync = find_frame_sync_joint(&bits)
+            .map(|s| s.matched as f32 / s.total as f32)
+            .unwrap_or(0.0);
+        let known = integer_offset_score(spectra, off);
+        scored.push((off, sync * 1000.0 + known));
+    }
+    // 降順。`sort_by` は安定なので同点は元の（offset 昇順）順を保つ。
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.into_iter().take(top_n.max(1)).map(|(o, _)| o).collect()
+}
+
 /// Score independent of TMCC data bits: correlate adjacent TMCC carriers
 /// after applying their known PRBS phase relation, as gr-isdbt does.
 pub fn integer_offset_score(spectra: &[Vec<Complex32>], offset: usize) -> f32 {

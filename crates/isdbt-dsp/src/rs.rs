@@ -123,6 +123,13 @@ impl Checker {
     }
 }
 
+/// syndromes の非ゼロ要素数。訂正を要したビット誤りの量（目安）。
+///
+/// 復調器の状態を時系列で観測するための診断用。0 なら bit error なし。
+pub fn syndrome_weight(block: &[u8]) -> usize {
+    syndromes(block).iter().filter(|&&x| x != 0).count()
+}
+
 /// RS復号（Berlekamp-Massey + Chien + Forney）。
 /// `block` は204バイト。訂正して返す（`Some`）。訂正不能なら `None`。
 /// 位置は `block[0]` が最高次（degree N-1）。
