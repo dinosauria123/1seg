@@ -1634,8 +1634,21 @@ impl Pipe {
                 self.dbg_segsp_ph_n[ph4] += 1;
                 let ysp = seg[l] / self.pilots.values[l];
                 let ysp2 = (ysp.re as f64) * (ysp.re as f64) + (ysp.im as f64) * (ysp.im as f64);
-                self.dbg_ysp_win += ysp2;
-                self.dbg_hsp_win += ysp2; // |H| = |Y| / |P| で |P| = 4/3 は定数
+                // `raw2` = |Y|^2（受信 SP の電力）、`ysp2` = |Y/P|^2 = |H|^2。
+                //
+                // 旧実装は `dbg_hsp_win += ysp2` としており、**両方に同じ値を
+                // 入れていた**。そのため `dbg_eq_sp()` が返す
+                // `(Ysp, Hsp)` は全サンプルの行で完全に一致し（実測
+                // 0.9994/0.9994、0.9968/0.9968…）、物理的にありえない
+                // 「SP の受信電力 == 推定チャネル」になっていた。
+                // `Ysp` と `Hsp` の**比**が等化器の Outer 伸長に相当する
+                // 量であり、このバグで常に 1.0 になっていた。
+                //
+                // SP 値は |P| = 4/3 なので |H| = |Y| / (4/3) = |Y| * 3/4、
+                // したがって |H|^2 = |Y|^2 * 9/16 = `ysp2`（= |Y|^2 / (4/3)^2）。
+                // `ysp2` 本身就��� |H|^2 なので}Hsp には `ysp2`、Ysp には `raw2`。
+                self.dbg_ysp_win += raw2;
+                self.dbg_hsp_win += ysp2;
                 self.dbg_spn += 1;
                 if self.dbg_spn >= 400 {
                     self.dbg_ysp_win = 0.0;
