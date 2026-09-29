@@ -485,7 +485,27 @@ impl RsBlockAssembler {
         let mut out = Vec::new();
         let mut burst = false;
         while self.buffer.len() >= TSP + self.phase {
-            if self.block_idx % reset_period() == self.reset_off {
+            // `ISDBT_RESETOFF=<n>` で reset 位相を外部から固定する（診断用）。
+            //
+            // 通常は `lock_params` が RS 復号率で `0..rp` を探索して決めるが、
+            // その探索は**先頭の短い窓**でのみ評価されるため、「序頭は正しく
+            // 後半で崩れる」症状なら正しい位相を選べている保証がない。
+            // そこで位相を外部から固定し、**全区間**の drop 率で逐一評価する。
+            // 診断: 強制した reset 位相を初回だけ出力する（どの探索結果が
+    // 使われたかを確認するため）。
+    if self.rs_blocks_seen == 0 {
+        eprintln!(
+            "[roff] lock_params が選んだ reset_off={} (ISDBT_RESETOFF={:?}) rp={}",
+            self.reset_off,
+            std::env::var("ISDBT_RESETOFF").ok(),
+            reset_period()
+        );
+    }
+    let ro = match std::env::var("ISDBT_RESETOFF") {
+                Ok(v) => v.parse().unwrap_or(self.reset_off),
+                Err(_) => self.reset_off,
+            };
+            if self.block_idx % reset_period() == ro {
                 self.prbs.reset_to(PRBS_INIT);
             }
             let start = self.phase;
