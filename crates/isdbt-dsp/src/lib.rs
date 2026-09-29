@@ -28,6 +28,7 @@ pub mod sync;
 pub mod viterbi;
 pub mod tmcc;
 pub mod rs;
+pub mod trace;
 pub mod ts;
 
 pub use deinterleave::{
