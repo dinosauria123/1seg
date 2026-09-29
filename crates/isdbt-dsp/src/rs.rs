@@ -130,14 +130,46 @@ pub fn syndrome_weight(block: &[u8]) -> usize {
     syndromes(block).iter().filter(|&&x| x != 0).count()
 }
 
+/// 復号失敗の理由（診断用）。
+///
+/// `syndrome_weight` は `[u8; 16]` の非ゼロ要素**数**なのでCorrections 上限 16 で
+/// 頭打ちになり、「訂正できた一模同样 16」「全然訂正できていない一模同样 16」と
+/// 区別できない（実測: `bit/blk` が全期間 16.0 に張り付いたまま drop が
+/// 0% → 100% に悪化した）。推定误差IES数�� NROOTS/2 を超えた、Chien 検索の
+/// 根数が一致しなかった、Forney の分母が 0、訂正後に syndrome が残った、を
+/// 区別できることが本科の診断上の必須。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fail {
+    /// Berlekamp-Massey の誤り位置多項式の次数が 0 または t(=8) を超えた。
+    TooManyErrors,
+    /// Chien 検索で見つけた根の数が `nerr` と一致しなかった。
+    RootCountMismatch,
+    /// Forney の分母 `sigma'(X^-1)` が 0。
+    ZeroDenominator,
+    /// 訂正後も syndrome が非ゼロ（誤訂正）。
+    Miscorrected,
+}
+
 /// RS復号（Berlekamp-Massey + Chien + Forney）。
 /// `block` は204バイト。訂正して返す（`Some`）。訂正不能なら `None`。
 /// 位置は `block[0]` が最高次（degree N-1）。
 pub fn decode(block: &[u8]) -> Option<Vec<u8>> {
+    decode_detail(block).0
+}
+
+/// `decode` と同じだが、推定 symbol 誤り数と失敗理由も返す。
+///
+/// 返り値は `(結果, 推定誤り数, 失敗理由)`。
+/// - 成功: `(Some(cw), nerr, None)`
+/// - 失敗: `(None, nerr, Some(理由))`
+///
+/// `nerr` は Chien 検索で実際に見つけた根の数であり、BM の `l` と同じなら
+/// 「訂正不能」の意味での误差IES数が直接得られる。
+pub fn decode_detail(block: &[u8]) -> (Option<Vec<u8>>, usize, Option<Fail>) {
     let gf = build_gf();
     let synd = syndromes(block);
     if synd.iter().all(|&x| x == 0) {
-        return Some(block.to_vec());
+        return (Some(block.to_vec()), 0, None);
     }
 
     // Berlekamp-Massey: 誤り位置多項式 sigma を求める
@@ -176,7 +208,7 @@ pub fn decode(block: &[u8]) -> Option<Vec<u8>> {
 
     let nerr = l;
     if nerr == 0 || nerr > NROOTS / 2 {
-        return None;
+        return (None, nerr, Some(Fail::TooManyErrors));
     }
 
     // Chien search: sigma の根 → 誤り位置。位置 i（0..N-1, block[0]が最高次 → 位置 i の符号 alpha^-i）
@@ -194,7 +226,7 @@ pub fn decode(block: &[u8]) -> Option<Vec<u8>> {
         }
     }
     if err_pos.len() != nerr {
-        return None;
+        return (None, nerr, Some(Fail::RootCountMismatch));
     }
 
     // Forney: 誤り値。omega = (sigma*S) mod x^NROOTS
@@ -221,7 +253,7 @@ pub fn decode(block: &[u8]) -> Option<Vec<u8>> {
             den ^= gf.mul(sigma[p], gf.pow((gf.log(xinv) as usize) * (p - 1)));
         }
         if den == 0 {
-            return None;
+            return (None, nerr, Some(Fail::ZeroDenominator));
         }
         // fcr=0: e = X^(1-fcr) * omega/sigma' = X * omega/sigma' … fcr=0 → X^1
         let e = gf.mul(gf.mul(num, gf.inv(den)), x);
@@ -229,9 +261,9 @@ pub fn decode(block: &[u8]) -> Option<Vec<u8>> {
     }
 
     if is_codeword(&out) {
-        Some(out)
+        (Some(out), nerr, None)
     } else {
-        None
+        (None, nerr, Some(Fail::Miscorrected))
     }
 }
 
