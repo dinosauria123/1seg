@@ -127,7 +127,10 @@ fn reset_frames() -> usize {
 const RESET_BLK: usize = 0;
 
 /// 1 ISDB-T フレーム = 204 OFDM シンボル（TMCC が全帯域共通で 1 フレームを通知する）。
-const TMCC_SYMS_PER_FRAME: usize = 204; // 0 = 無効（Pipe::resync は Viterbi を壊す。上記コメント参照）
+const TMCC_SYMS_PER_FRAME: usize = 204;
+
+/// 段別ダンプのリング長。1 RS ブロック分に十分大きい。
+const DUMP_RING: usize = 8192; // 0 = 無効（Pipe::resync は Viterbi を壊す。上記コメント参照）
 const PRBS_INIT: u16 = 0xa9;
 
 /// bin offset 探索半径。capture ごとに数 bin のズレが出るので TMCC 同期で決める。
@@ -401,6 +404,12 @@ struct RsBlockAssembler {
     pub drop_burst_hist: [u64; 64],
     /// 最長バースト。
     pub drop_burst_max: u64,
+    /// 段別ダンプの対象ブロック番号（`rs_blocks_seen` 基準）。
+    pub dump_target: u64,
+    /// 段別ダンプを有効にするか。
+    pub dump_enabled: bool,
+    /// 実際の RS 入力ブロック（descramble 後、204 バイト）。
+    pub dump_byte: Vec<u8>,
     pub rs_sync_ok: u64,
     pub rs_seen_decoded: u64,
     /// 訂正を要した RS ブロック数（復調 bit error の指標）。
@@ -467,7 +476,7 @@ const BURST_THRESHOLD: usize = 32;
 
 impl RsBlockAssembler {
     fn new(phase: usize, reset_off: usize) -> Self {
-        Self { buffer: Vec::with_capacity(TSP), phase, reset_off, prbs: EnergyPrbs::with_init(PRBS_INIT), block_idx: 0, drop_burst_hist: [0u64; 64], drop_burst_max: 0, rs_sync_ok: 0, rs_seen_decoded: 0, rs_corrected: 0, rs_bit_errors: 0, rs_symbol_errors: 0, rs_fail_reasons: [0; 4], rs_dropped: 0, rs_miscorrected: 0, rs_blocks_seen: 0, drop_burst: 0, burst_raised: false, drop_by_mod64: [0u32; 64], drop_by_mod256: [0u32; 256], drop_seen_blocks: 0 }
+        Self { buffer: Vec::with_capacity(TSP), phase, reset_off, prbs: EnergyPrbs::with_init(PRBS_INIT), block_idx: 0, dump_target: u64::MAX, dump_enabled: false, dump_byte: Vec::new(), drop_burst_hist: [0u64; 64], drop_burst_max: 0, rs_sync_ok: 0, rs_seen_decoded: 0, rs_corrected: 0, rs_bit_errors: 0, rs_symbol_errors: 0, rs_fail_reasons: [0; 4], rs_dropped: 0, rs_miscorrected: 0, rs_blocks_seen: 0, drop_burst: 0, burst_raised: false, drop_by_mod64: [0u32; 64], drop_by_mod256: [0u32; 256], drop_seen_blocks: 0 }
     }
 
     /// 復号できた RS ブロックを返す。訂正不能なブロックは**出力しない**
@@ -540,6 +549,25 @@ impl RsBlockAssembler {
             // 復調 bit error の推移を時系列で見るため記録する
             // （実測 2026-09-26: 開始 +0MB で H.264 MB エラー 2.77/s だった
             //  capture は +10MB にすると 0.10/s に激減した。等化器の収束待ち）。
+            // 段別バイトダンプ: **実際に RS へ入る 204 バイト**を保存する。
+            //
+            // 呼び出し側の byte ステージから取ると RS ブロック境界と
+            // ずれて`](先頭が 0x8F で 0x47 にならない)`ので.dump、
+            // アセンブラが 1 ブロックを完成させたタイミングで取る。
+            // 段別ダンプ: RS へ入る 1 ブロック（descramble 後、204 バイト）。
+            //
+            // soft / vit は**このブロックに対応する範囲だけ**が欲���い。
+            // アセンブラに入る直前の `self.dbg_bytes_to_rs` カウンタを
+            // ブロック先頭で記録し、長さで切り出す（Viterbi depth と
+            // byte 遅延を厳密に合わせるため）。
+            if self.dump_enabled {
+                if self.rs_blocks_seen == self.dump_target {
+                    self.dump_byte = ds.clone();
+                    eprintln!("[dump] assembler hit block {}", self.rs_blocks_seen);
+                    // 選択済み soft / vit は Pipe 側で切り出す
+                    // （ここではアセンブラなのでアクセスできない）。
+                }
+            }
             let nz = rs::syndrome_weight(&ds);
             // 復号器が受け取ったブロックを数える。訂正不要（synd 全ゼロ）でも
             // 数える。訂正不能率の正しい分母。
@@ -1016,6 +1044,22 @@ struct Pipe {
     pub t_n: usize,
     /// TMCC フレーム境界（204 シンボルごと）の RS ブロック位置。
     pub tmcc_frame_pos: Vec<usize>,
+    /// 段ごとバイトダンプ（`ISDBT_DUMP=<blk>`、既定無効）。
+    ///
+    /// 「どこで情報が失われるか」を 1 ブロック単位で追うためのもの。
+    /// 既存のトレースは統計値（平均/RMS）しか出さないため、
+    /// 「健全な平均」に隠れた 1 バイトの変化が見えなかった。
+    ///
+    /// - `dump_soft`: depuncture 後の soft を {-1,0,+1} に量子化したビット列
+    /// - `dump_vit`: Viterbi 出力ビット列（0/1）
+    /// - `dump_byte`: byte デインターリーブ後、RS へ入る直前のバイト列
+    pub dump_target: Option<u64>,
+    /// 段別ダンプが有効か（`Pipe` 側フラグ、`rs_asm.dump_enabled` と対応）。
+    pub dump_enabled: bool,
+    pub dump_soft: Vec<u8>,
+    pub dump_vit: Vec<u8>,
+    pub dump_byte: Vec<u8>,
+    pub dump_capture: bool,
     /// 現在の TMCC フレーム内でのシンボル数（0..204）。
     pub tmcc_sym_count: usize,
     /// 訂正不能が連続して `BURST_THRESHOLD` 個に達したイベント。
@@ -1225,6 +1269,12 @@ impl Pipe {
             t_sum_us: 0,
             t_max_us: 0,
             t_n: 0,
+            dump_target: None,
+            dump_enabled: false,
+            dump_soft: Vec::new(),
+            dump_vit: Vec::new(),
+            dump_byte: Vec::new(),
+            dump_capture: false,
             tmcc_frame_pos: Vec::new(),
             tmcc_sym_count: 0,
             burst_raised: false,
@@ -1277,6 +1327,7 @@ impl Pipe {
         let _t_start = std::time::Instant::now();
         self.dbg_syms += 1;
         self.syms_done += 1;
+
         let sym_mod4 = (phase0 + k) % 4;
         let seg = extract_segment(spec, self.seg_off);
         // 診断: 機械導出した `sym_mod4` と、信号の実位相から測った
@@ -1883,6 +1934,14 @@ impl Pipe {
                 }
             }
             for kept in [de[1], de[0]] {
+                if self.dump_enabled {
+                    // 直近 1 ブロック分だけ保持する固定長リング。
+                    // 4M まで溜めると切り出しが意味を失う（実測）。
+                    if self.dump_soft.len() >= DUMP_RING {
+                        self.dump_soft.drain(0..DUMP_RING / 4);
+                    }
+                    self.dump_soft.push(if kept == 0.0 { 2 } else if kept > 0.0 { 1 } else { 0 });
+                }
                 // order=1
                 loop {
                     let pat = PUNCTURE_2_3[self.depu_pos % PUNCTURE_2_3.len()];
@@ -1928,6 +1987,12 @@ impl Pipe {
                 Some(b) => b,
                 None => continue,
             };
+            if self.dump_enabled {
+                if self.dump_vit.len() >= DUMP_RING {
+                    self.dump_vit.drain(0..DUMP_RING / 4);
+                }
+                self.dump_vit.push(bit & 1);
+            }
             self.bit_acc = (self.bit_acc << 1) | (bit & 1);
             self.bit_cnt += 1;
             self.dbg_bits += 1;
@@ -2050,6 +2115,16 @@ impl Pipe {
         // RS ブロック番号の 64 周期でリセットしており、この 2 つが
         // 一致する保証はない。TMCC 境界と 64 周期がずれていれば、
         // 後半で PRBS 位相がずれて RS が壊れる（観測された症状）。
+        // 段別ダンプ: 対象ブロックの soft / vit を对齐して切り出す。
+        if self.rs_asm.dump_enabled && self.rs_asm.rs_blocks_seen == self.rs_asm.dump_target {
+            // Pipe のリングから対象ブロック分だけを取り出す。
+            let s_need = rs::N * 8 * 3 / 2;   // 母符号長 = 204*8*3/2
+            let v_need = rs::N * 8;             // 情報ビット長 = 204*8
+            let so = self.dump_soft.len().saturating_sub(s_need);
+            let vo = self.dump_vit.len().saturating_sub(v_need);
+            self.dump_soft = self.dump_soft[so..].to_vec();
+            self.dump_vit = self.dump_vit[vo..].to_vec();
+        }
         self.tmcc_sym_count += 1;
         if self.tmcc_sym_count >= TMCC_SYMS_PER_FRAME {
             self.tmcc_sym_count = 0;
@@ -2404,6 +2479,18 @@ impl StreamingDecoder {
             seg_off,
         });
         self.pipe = Some(Pipe::new(commutator, reset_off, block_phase, seg_off));
+        // `ISDBT_DUMP=<blk>` で段別バイトダンプを有効にする（診断用）。
+        if let Ok(v) = std::env::var("ISDBT_DUMP") {
+            if let Ok(b) = v.parse::<u64>() {
+                if let Some(p) = self.pipe.as_mut() {
+                    p.dump_target = Some(b);
+                    p.rs_asm.dump_target = b;
+                    p.rs_asm.dump_enabled = true;
+                    p.dump_enabled = true;
+                    eprintln!("[dump] 対象ブロック = {} (rs_blocks_seen 基準)", b);
+                }
+            }
+        }
         // 診断: `ISDBT_TRACE=<blk>` で指定ブロック（と最初の訂正不能）の
         // 全段トレースを有効にする。
         if let Ok(v) = std::env::var("ISDBT_TRACE") {
@@ -2786,6 +2873,14 @@ impl StreamingDecoder {
     /// 診断: `self.buf.len()`（バッファ長）。
     pub fn dbg_buf_len(&self) -> u64 { self.buf.len() as u64 }
     /// 診断: 全ブロックの `(ブロック番号, depu_pos % 4)`。
+    /// 段別バイトダンプ `(soft量子化ビット, Viterbi出力ビット, byte整列後バイト)`。
+    pub fn dump_stages(&self) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        self.pipe
+            .as_ref()
+            .map(|p| (p.dump_soft.clone(), p.dump_vit.clone(), p.rs_asm.dump_byte.clone()))
+            .unwrap_or((vec![], vec![], vec![]))
+    }
+
     /// TMCC フレーム境界の RS ブロック位置。
     pub fn dbg_tmcc_frame_pos(&self) -> Vec<usize> {
         self.pipe.as_ref().map(|p| p.tmcc_frame_pos.clone()).unwrap_or_default()

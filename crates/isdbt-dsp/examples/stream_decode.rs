@@ -553,6 +553,24 @@ fn main() {
     // **TMCC 同期語が現れる位置**（`d_frame_end`）から作る。我々は
     // RS ブロック番号の 64 周期でリセットしており、この 2 つが
     // 一致する保証はない。ずれれば後半で PRBS 位相がずれて RS が壊れる。
+    // 段別バイトダンプ（`ISDBT_DUMP=<blk>`）。
+    // 「どこで情報が失われるか」を 1 ブロック単位で追う。
+    if std::env::var("ISDBT_DUMP").is_ok() {
+        let (soft, vit, byte) = dec.dump_stages();
+        if !byte.is_empty() {
+            let name = std::env::var("ISDBT_DUMP").unwrap();
+            let base = format!("/tmp/dump_{}", name);
+            // soft: 0/1/2 (2=erasure) を '0'/'1'/'.' に
+            let s2: String = soft.iter().map(|&b| match b { 2 => '.', 1 => '1', _ => '0' }).collect();
+            let v2: String = vit.iter().map(|&b| if b != 0 { '1' } else { '0' }).collect();
+            let hex = |v: &[u8]| v.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join("");
+            std::fs::write(format!("{}.soft.txt", base), &s2).ok();
+            std::fs::write(format!("{}.vit.txt", base), &v2).ok();
+            std::fs::write(format!("{}.byte.hex", base), hex(&byte)).ok();
+            eprintln!("[dump] blk={} soft={}B vit={}b byte={}B -> {}",
+                name, soft.len(), vit.len(), byte.len(), base);
+        }
+    }
     if std::env::var("ISDBT_TMCCFRM").is_ok() {
         let h = dec.dbg_tmcc_frame_pos();
         let mut gaps = String::new();
