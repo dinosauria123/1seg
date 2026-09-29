@@ -71,13 +71,10 @@ pub fn normalize_continuity(ts: &mut [u8]) {
             continue;
         }
         let mut cc = ts[i + 3] & 0x0f;
-        if let Some(&(pcc, ppusi)) = last.get(&pid) {
-            let expect = if pusi != 0 && ppusi == 0 {
-                // 新しい PES の先頭: CC は 0 に戻ってよい。
-                0
-            } else {
-                pcc.wrapping_add(1) & 0x0f
-            };
+        if let Some(&(pcc, _ppusi)) = last.get(&pid) {
+            // PES 境界でも CC はリセットしない（ISO/IEC 13818-1 §2.4.3.3）。
+            // 詳細は `ContinuityTracker::push` のコメントを参照。
+            let expect = pcc.wrapping_add(1) & 0x0f;
             if cc != expect {
                 // 欠損した 1 個を詰め直す。
                 cc = expect;
@@ -371,12 +368,18 @@ impl ContinuityTracker {
             let afc = (ts[i + 3] >> 4) & 0x03;
             let has_payload = afc == 0x01 || afc == 0x03;
             if has_payload {
-                if let Some(&(pcc, ppusi)) = self.last.get(&pid) {
-                    let expect = if pusi != 0 && ppusi == 0 {
-                        0
-                    } else {
-                        pcc.wrapping_add(1) & 0x0f
-                    };
+                if let Some(&(pcc, _ppusi)) = self.last.get(&pid) {
+                    // **PID ごとに CC は連続して増加し続ける**（ISO/IEC 13818-1
+                    // §2.4.3.3）。PES 境界（`pusi` の 0→1 遷移）で CC を
+                    // リセットしてはならない。
+                    //
+                    // 誤った実装（`if pusi != 0 && ppusi == 0 { 0 }`）のとき、
+                    // 映像 PID 0x0581 で CC 違反 82 件が**全期間に均等**に
+                    // 発生し、すべて「cc=N → 1」という形になっていた（実測
+                    // 2026-09-29）。libdvbpsi が `TS discontinuity
+                    // (received 1, expected N)` を出し、VLC は
+                    // `buffer deadlock prevented` で 0:00 に停止した。
+                    let expect = pcc.wrapping_add(1) & 0x0f;
                     if cc != expect {
                         cc = expect;
                         ts[i + 3] = (ts[i + 3] & 0xf0) | cc;
