@@ -41,6 +41,22 @@ fn main() {
     // PAT/PMT 注入。1seg は PAT(PID 0) を欠くため、VLC などのプレイヤーが
     // program を解決できず "buffer deadlock prevented" で停止する。既定で有効。
     let mut inject_psi = true;
+    // --vlc-ready: ファイル出力のあと automatically に ffmpeg remux を通し、
+    // VLC / ffplay が確実に開ける TS に書き換える（既定で有効）。
+    //
+    // なぜ必要か（実測 2026-09-29）:
+    // demod が出す生 TS は以下を満たさない。
+    //   - null パケット（PID 0x1FFF）が全体の 18%。1seg の帯域が 400 kbps しか
+    //     なく、 stuffing が元から多い。生 TS では demod が 1 本ずつ排出する。
+    //   - PCR 専用パケット (afc=0b10) として `psi::pcr_packet` を注入するが、
+    //     libdvbpsi は PCR_PID 上の CC を映像 PID の CC と共有とみなすことがある。
+    // ffmpeg の `-c copy` remux はこれらを是正し、 PID を 0x0100/0x0101 に
+    // 振り替え、 null を落とし、 PSI/PCR を正規化する。実測で
+    // `duration` 36.08 秒・H.264 320x180・MB エラー 159 件で再生できる。
+    //
+    // stdout（パイプ）へ出すときは live に途切れずolerant 必要性があるため
+    // remux しない（呼び出し側が ffplay へ直結する）。
+    let mut vlc_ready = outpath != "-";
     // --follow: 入力が「まだ伸びているファイル」のとき、EOF(=Ok(0)) でも終了せず
     // 新しく書き込まれたぶんを待ち続ける。
     //
@@ -100,6 +116,7 @@ fn main() {
             "--follow" => follow = true,
             "--chunk" => chunk = a.next().expect("--chunk N").parse().expect("chunk"),
             "--no-psi" => inject_psi = false,
+            "--vlc-ready" => vlc_ready = true,
             other => panic!("unknown flag: {other}"),
         }
     }
@@ -156,18 +173,67 @@ fn main() {
         if std::env::var("ISDBT_DEBUG").is_ok() {
             let (rc, rb) = dec.rs_error_stats();
             let (_, _, drop, mis) = dec.rs_quality();
+            let seen = dec.rs_blocks_seen();
+            // `symerr` = RS が推定した symbol 誤り数の累計。
+            // `rs_bit_errors`（`訂正bit`）は 16 で頭打ちなので診断に使えない。
+            let (se, _) = dec.rs_symbol_error_stats();
+            let spb = se as f64 / seen.max(1) as f64;
+            let fr = dec.rs_fail_reasons();
+            // 直近の (ブロック番号, depu_pos % 4)。1 OFDM フレーム = 64 ブロック
+            // なので、**64 ブロック周期で同じ値へ戻る**のが正しい。
+            // 戻らなくなれば depuncture の位相がスリップしている = 復調が壊れる。
+            // `soft` = Viterbi へ入る前のソフト値の自信度（|x|、理想 1.0）。
+            // これが 1.0 のままなのに RS が全滅するなら、demap 以降の問題。
+            // 逆にこれが落ちていれば、等化器/demap 段が壊れている。
+            let sf = dec.dbg_soft_abs();
+            let havg = dec.dbg_h_avg();
+            // `m4` = 機械的に決めた sym_mod4 と、信号から測った実際の位相。
+            // **不一致なら pilot 配置が 1 象限ずれ**て等化器が「健全な誤り」を出す。
+            let (m4u, m4a) = (dec.dbg_sym_mod4_used(), dec.dbg_sym_mod4_actual());
+            let dp = {
+                let v = dec.dbg_depu_phase();
+                let tail: Vec<(usize, usize)> = v.iter().rev().take(4).rev().copied().collect();
+                tail.iter().map(|(b, p)| format!("{b}:{p}")).collect::<Vec<_>>().join(",")
+            };
             eprintln!(
-                "[dbg] in={n}B out={}B locked={} backlog={}sym rs_err={rc}/{rb}blk rs_drop={drop} rs_mis={mis}",
+                "[dbg] in={n}B out={}B locked={} backlog={}sym 訂正blk={rc} 訂正bit={rb} 総blk={seen} drop={drop} mis={mis} symerr={se} symerr/blk={spb:.2} fail={fr:?} depu={dp:?} soft={sf:.4} h={havg:.2} m4={m4u}/{m4a}",
                 ts.len(),
                 dec.is_locked(),
                 dec.backlog_syms(),
             );
-            // 復調パイプライン各段の通過数（94% 欠損の切り分け用）
+            // 診断: SP 1 本単位の異常率（`ISDBT_SPBAD=1`）。
+            //
+            // 判定: 全 k が同程度なら SNR 劣化（確率的）、
+            // 特定の少数の k だけ突出なら `prbs_pilot_values()` の
+            // ビットレベルのバグ（決定的）。
+            if std::env::var("ISDBT_SPBAD").is_ok() {
+                let rates = dec.dbg_sp_bad_rate();
+                for ph in 0..4 {
+                    let mut line = format!("[spbad] ph={ph}");
+                    for k in 0..36 {
+                        if rates[ph][k] >= 0.0 {
+                            line.push_str(&format!(" {:.2}", rates[ph][k]));
+                        }
+                    }
+                    eprintln!("{line}");
+                }
+            }
+            // 復調パイプライン各段の通過数
             eprintln!(
                 "[pipe] bits={} bytes={} drop_comm={} drop_lat={} to_rs={} nblk={}",
                 dec.dbg_bits(), dec.dbg_bytes(), dec.dbg_drop_commutator(),
                 dec.dbg_drop_latency(), dec.dbg_bytes_to_rs(), dec.dbg_nblk(),
             );
+            // 診断: 1 シンボルの平均/最大処理時間。CPU 律速かの判定に使う。
+            {
+                let (tn, tsum, tmax) = dec.dbg_timing();
+                if tn > 0 {
+                    eprintln!(
+                        "[time] syms={} avg={:.1}us max={}us 計={:.1}s",
+                        tn, tsum as f64 / tn as f64, tmax, tsum as f64 / 1e6
+                    );
+                }
+            }
             eprintln!(
                 "[sym] calls={} warmup={} carriers={} bits/sym={:.1} bits/carrier={:.2}",
                 dec.dbg_syms(), dec.dbg_syms_warmup(), dec.dbg_carriers(),
@@ -181,7 +247,180 @@ fn main() {
                 dec.dbg_h_avg(), dec.dbg_h_phase_var(), dec.dbg_cfo_slope(),
                 if dec.dbg_sym_mod4_used() == dec.dbg_sym_mod4_actual() { "OK" } else { "MISMATCH" },
                 dec.dbg_soft_abs(), dec.dbg_soft_degraded(),
-            )
+            );
+            // 診断: soft クランプ（±8.0）の飽和率。飽和が増えると soft 平均は
+            // 上がるが解像度が失われ、トレリスのパス間メトリック差が縮む。
+            {
+                let (tot, sat, nan) = dec.dbg_saturation();
+                if tot > 0 {
+                    eprintln!(
+                        "[sat] 総={} 飽和={} ({:.4}%) 非有限={} ({:.4}%)",
+                        tot, sat, sat as f64 / tot as f64 * 100.0,
+                        nan, nan as f64 / tot as f64 * 100.0
+                    );
+                }
+            }
+            // 診断: Viterbi トレリスの健全性。metric 乖離が狭まる /
+            // 有限状態数が減る / out キューが枯渇するなら、トレリスが
+            // 「判断不能」に落ちている。乗離は理論上 depth 程度に張り付くはず。
+            {
+                let (vn, vspread, vfin, vout) = dec.dbg_viterbi();
+                if vn > 0 {
+                    eprintln!(
+                        "[vit] n={} 乖離={:.3} 有限状態={}/64 out長={}",
+                        vn, vspread, vfin, vout
+                    );
+                }
+            }
+            // 診断: 整列パラメータ（commutator / reset_off / block_phase）。
+            // これらは起動時 1 回だけ決まる。後半で真の整列位置からずれるなら
+            // 「固定値だが他の量がドリフトする」構造の証拠になる。
+            {
+                let (cm, ro, bp) = dec.dbg_align_params();
+                eprintln!("[align] commutator={} reset_off={} block_phase={}", cm, ro, bp);
+            }
+            // 診断: 等化後の外挿発散。外挿 carrier で `|H|^2` が閾値を超えると
+            // そこで soft が ±8 に張り付き、RS 訂正限界を超える。
+            // これが時間とともに増えるのか定常的なのか、時系列で判定する。
+            if std::env::var("ISDBT_EQSTAT").is_ok() {
+                let (hot, n, pos, ema) = dec.dbg_eq_hot();
+                if n > 0 {
+                    // 分子・分母の**瞬時平均**（区間_reset しない）。
+                    // 累積平均は変化が見えないので、区間ごとに作り直す。
+                    let (y, h, h2, y2) = dec.dbg_eq_win();
+                    // SP 位置だけの窓平均。FFT 窓ずれの影響が HERE で出る。
+                    let (ysp, hsp) = dec.dbg_eq_sp();
+                    eprintln!(
+                        "[eqhot] hot={} n={} ({:.3}%) maxEMA={:.2} |Y|={:.4} |H|={:.4} EQ={:.4} y2={:.4} Ysp={:.4} Hsp={:.4} bf={:+.4} SegSP={:.4} Ph=[{:.3},{:.3},{:.3},{:.3}] CI={:.4} INC={:.3} R204={:.4} R205={:.4} R216={:.4} R100={:.4} I204={:.4} I205={:.4} I216={:.4} I100={:.4} PV={:#010x} T204={:.5} T210={:.5} T192={:.5} T216={:.5} T100={:.5} T207={:.5} RN={} RJ={}",
+                        hot, n, hot as f64 / n as f64 * 100.0, ema, y, h, h2, y2, ysp, hsp,
+                        dec.dbg_boundary_frac().0, dec.dbg_seg_sp(), {
+                            let p = dec.dbg_seg_sp_phase();
+                            (p[0], p[1], p[2], p[3])
+                        }.0,
+                        {
+                            let p = dec.dbg_seg_sp_phase();
+                            (p[0], p[1], p[2], p[3])
+                        }.1,
+                        {
+                            let p = dec.dbg_seg_sp_phase();
+                            (p[0], p[1], p[2], p[3])
+                        }.2,
+                        {
+                            let p = dec.dbg_seg_sp_phase();
+                            (p[0], p[1], p[2], p[3])
+                        }.3,
+                        dec.dbg_sp_coherence(), dec.dbg_sp_incoh_frac(),
+                        dec.dbg_track_pairs()[0],
+                        dec.dbg_track_pairs()[1],
+                        dec.dbg_track_pairs()[2],
+                        dec.dbg_track_pairs()[3],
+                        dec.dbg_track_pairs()[6],
+                        dec.dbg_track_pairs()[7],
+                        dec.dbg_track_pairs()[8],
+                        dec.dbg_track_pairs()[9],
+                        dec.dbg_pval204().0,
+                        dec.dbg_ts_delta()[0],
+                        dec.dbg_ts_delta()[1],
+                        dec.dbg_ts_delta()[2],
+                        dec.dbg_ts_delta()[3],
+                        dec.dbg_ts_delta()[4],
+                        dec.dbg_ts_delta()[5],
+                        dec.dbg_raq_miss().0,
+                        dec.dbg_raq_miss().1
+                    );
+                    // 診断: 絶対 spectrum bin 502..=522 の `|seg[k]|²`。
+                    // `l` ではなく spectrum 位置で null の幅と位置を見る。
+                    let absv = dec.dbg_abs_profile();
+                    let mut aout = String::new();
+                    for (i, v) in absv.iter().enumerate() {
+                        aout.push_str(&format!("{:.5} ", v));
+                    }
+                    eprintln!("[absprof] {}", aout);
+                    // null profile を出力する。11 キャリアの ema をそれぞ���
+                    // `[prof]` として 1 行。
+                    if std::env::var("ISDBT_PROF").is_ok() {
+                        let pr = dec.dbg_profile();
+                        let mut pl = format!("[prof] hot={:.3}", hot as f64 / n as f64 * 100.0);
+                        for v in pr.iter() {
+                            pl.push_str(&format!(" {v:.5}"));
+                        }
+                        eprintln!("{pl}");
+                    }
+                    // 位置Diagnose: 頻度が時間とともに増えるのか、
+                    // 位置（周波数）が固定なのか拡大するかを切り分ける。
+                    // 432 bin のうち発散した bin の分布を dump する。
+                    if std::env::var("ISDBT_EQPOS").is_ok() && n > 0 && n % 200_000 < 60_000 {
+                        let mut s = String::new();
+                        let tot: u64 = pos.iter().sum();
+                        if tot > 0 {
+                            for (b, &v) in pos.iter().enumerate() {
+                                if v * 200 > tot {
+                                    s.push_str(&format!("{}:{}({:.1}%) ", b, v,
+                                        v as f64 / tot as f64 * 100.0));
+                                }
+                            }
+                        }
+                        eprintln!("[eqpos] 総={} {}", tot, s);
+                    // **実キャリア番号 `l`** 単位の分布。旧 `[eqpos]` は
+                    // `i*432/n` の 432 等分 bin なので 4 キャリアずつ
+                    // まとめられていた（実測ミス 3）。ここでは `l` 精度。
+                    // SP 帯域像の前半/後半比較。周波数選択性フェージング
+                    // なら山形全体が「うねる」、1 本だけなら l=204 固有。
+                    if std::env::var("ISDBT_SPBAND").is_ok() {
+                        let (a, na, b, nb) = dec.dbg_sp_band_split();
+                        if nb > 0 {
+                            let mut s = String::new();
+                            for l in 0..432 {
+                                if a[l] > 0.0 && b[l] > 0.0 {
+                                    s.push_str(&format!(
+                                        "{l}:{:.3}/{:.3} ",
+                                        a[l].sqrt(),
+                                        b[l].sqrt()
+                                    ));
+                                }
+                            }
+                            eprintln!("[spband] na={na} nb={nb} {s}");
+                        }
+                    }
+                    if std::env::var("ISDBT_HOTL").is_ok() {
+                        let hl = dec.dbg_hot_carriers();
+                        let mut lt = String::new();
+                        for (l, &v) in hl.iter().enumerate() {
+                            if v * 100 > tot {
+                                lt.push_str(&format!("{l}:{v} "));
+                            }
+                        }
+                        eprintln!("[hotl] 総={tot} {lt}");
+                    }
+                    }
+                }
+            }
+            // 診断: `boundary_frac` の値域。設計上の前提は [-0.5, 0.5]。
+            // これを外えると線形補間の重みも繰り上がりも破綻する。
+            if std::env::var("ISDBT_FRACSTAT").is_ok() {
+                let f = dec.dbg_boundary_frac();
+                eprintln!("[frac] boundary_frac={:+.4} timing_frac={:+.4} frac_carry={:+.4}", f.0, f.1, f.2);
+            }
+            // 診断: `cur` と 1 シンボル長 / 1 OFDM フレームの整除性。
+            // FFT 窓境界が一貫していれば `cur % sym` は常に 0。
+            // これが時間とともにずれていれば、境界ドリフトが原因。
+            if std::env::var("ISDBT_CUREM").is_ok() {
+                eprintln!(
+                    "[currem] cur={} %sym={} %frame={} k={}",
+                    dec.dbg_cur(), dec.dbg_cur_rem(), dec.dbg_cur_frame_rem(),
+                    dec.dbg_syms()
+                );
+            }
+            // 診断: DC 固定値 vs 局所平均。差が開いているなら DC ドリフト。
+            // `self.cur`（絶対インデックス）と `self.buf.len()` も出す。
+            eprintln!(
+                "[dc] 固定=({:+.4},{:+.4}) 局所=({:+.4},{:+.4}) 差=({:+.4},{:+.4}) cur={} buf={}",
+                dec.dbg_dc_fixed(), dec.dbg_dc_fixed_im(),
+                dec.dbg_dc_local(), dec.dbg_dc_local_im(),
+                dec.dbg_dc_local() - dec.dbg_dc_fixed(),
+                dec.dbg_dc_local_im() - dec.dbg_dc_fixed_im(),
+                dec.dbg_cur(), dec.dbg_buf_len(),
+            );
         }
         if !ts.is_empty() {
             if !started {
@@ -281,4 +520,165 @@ fn main() {
         "終了: {ndec}/{nblk} ブロック復号 ({:.1}%)",
         100.0 * ndec as f32 / nblk.max(1) as f32
     );
+    // 診断: 落下 block の `block_idx % 256` 分布。1 [dbg] 間隔(214 blk)あたり
+    // 36 個が常に落ちるので、特定の block 位置が構造的に落ちているかを見る
+    // （commutator / reset_off / block_phase の周期 64 block との関連）。
+    // 診断: 1 TSD あたりの degraded 数のヒストグラム。
+    // 平均が動かないまま「8 以上」（RS 訂正限界）の占比だけ増えれば、バースト性
+    // （クラスタリング）が原因。RS は t=8 の閾値判定なので、正常工作域は 0-7。
+    if std::env::var("ISDBT_HIST").is_ok() {
+        let (h, n) = dec.dbg_degraded_hist();
+        let mut s = String::new();
+        for (i, &v) in h.iter().enumerate() {
+            if v > 0 {
+                s.push_str(&format!("{}:{}({:.1}%) ", i, v, v as f64 / n.max(1) as f64 * 100.0));
+            }
+        }
+        eprintln!("[hist] ブロック数={} {}", n, s);
+    }
+    // 診断: 全ブロックの `depu_pos % 4`。**復号不能ブロックも含む**ので、
+    // 劣化域（drop 100%）でも値が更新され続ける。64 ブロック周期で戻るはず。
+    if std::env::var("ISDBT_DEPUALL").is_ok() {
+        let d = dec.dbg_depu_all();
+        let mut out = String::new();
+        for (b, p) in d.iter() {
+            out.push_str(&format!("{b}:{p} "));
+        }
+        eprintln!("[depuall] {}", out);
+    }
+    // 診断: `depu_pos % 4` の推移。64 ブロック（1 OFDM フレーム）ごとに
+    // 同じ値へ戻るかを見る。戻らなければ depuncture の位相がスリップしている。
+    if std::env::var("ISDBT_DEPSTAGE").is_ok() {
+        let d = dec.dbg_depu_phase();
+        // 連続する 2 ブロック間隔で取り、ブロック番号と mod 4 を並べる
+        let mut out = String::new();
+        for w in d.windows(2) {
+            if w[1].0 - w[0].0 == 2 {
+                out.push_str(&format!("{}:{} ", w[0].0, w[0].1));
+            }
+        }
+        eprintln!("[depustage] {}", out);
+    }
+    // 診断: `reacquire` のジャンプ履歴。
+    //
+    // 「reacquire が徐々に間違った答えを選ぶ確率が上がっている」なら
+    // 大きくジャンプした回数が blk 数とともに増える。`Δ` 自体は
+    // 0..16 に収まるので絶対値は小さく、**blk 軸での変化**を見る。
+    // 診断: `|h[204]|` / `|h[216]|` / `|h[205]|` の瞬時分布。
+    //
+    // 窓平均は分布の形を隠す。`hot = |Y|²/|H|² > 10` は**瞬時値**の
+    // 閾値判定なので、平均 grow と hot 増加が矛盾なく両立するには
+    // 「下側の裾が伸びる」ことが必要。4 時点の凍結累積で時系列化。
+    if std::env::var("ISDBT_HDIST").is_ok() {
+        let (_cur, snap) = dec.dbg_h_dist();
+        for (ph, s) in snap.iter().enumerate() {
+            for (slot, hst) in s.iter().enumerate() {
+                let tot: u64 = hst.iter().sum();
+                if tot == 0 {
+                    continue;
+                }
+                let mut out = String::new();
+                for (b, c) in hst.iter().enumerate() {
+                    if *c > 0 {
+                        out.push_str(&format!("{:.3}:{} ", -6.0 + b as f64 / 5.0, c));
+                    }
+                }
+                eprintln!("[hdist] ph={ph} slot={slot} n={tot} {}", out);
+            }
+        }
+    }
+    if std::env::var("ISDBT_RAQJUMP").is_ok() {
+        let h = dec.dbg_raq_history();
+        let mut out = String::new();
+        for w in h.chunks(2) {
+            if w.len() == 2 {
+                let blk = w[0];
+                let jump = (w[1] as i64) / 2 - 1000;
+                out.push_str(&format!("{blk}:{jump} "));
+            }
+        }
+        eprintln!("[raqjump] {}", out);
+    }
+    if std::env::var("ISDBT_DROPPOS").is_ok() {
+        let (dist, total) = dec.dbg_drop_pos();
+        let mut line = String::new();
+        for (i, &v) in dist.iter().enumerate() {
+            if v > 0 {
+                line.push_str(&format!("{}:{} ", i, v));
+            }
+        }
+        eprintln!("[droppos] 合計={} {}", total, line);
+    }
+
+    // --- VLC ready remux ---
+    //
+    // 生 TS は 1seg の帯域制約（400 kbps）と demod 側の PSI 注入 Meehan の
+    // 都合で、VLC が確実に開ける形式になっていない。ffmpeg の `-c copy`
+    // remux は null 詰め物を落とし、 PID を 0x0100/0x0101 に振り替え、
+    // PSI/PCR/CC を正規化するので、**出力ファイル自体を VLC ready にする**。
+    //
+    // 実測 2026-09-29: remux 前は null 1643/9078 (18%)・CC 違反 82 件で
+    // VLC が 0:00 に停止。remux 後は null 0・CC 正常・duration 36.08 秒・
+    // H.264 320x180 で正常に再生できる。
+    if vlc_ready && outpath != "-" {
+        remux_vlc_ready(&outpath);
+    }
+}
+
+/// 出力量を ffmpeg remux で VLC ready な TS に書き換える（in-place）。
+///
+/// `ffmpeg` が見つからない場合は警告して元のまま残す（-demod の結果は捨てない）。
+fn remux_vlc_ready(path: &str) {
+    let ffmpeg = match std::env::var("FFMPEG").ok().or_else(|| {
+        // PATH に ffmpeg がない場合に備えて、このワークスペースの同梱版も試す。
+        let p = format!(
+            "{}/.hermes/tools/ffmpeg-9.0.1-linux-x64/bin/ffmpeg",
+            std::env::var("HOME").unwrap_or_default()
+        );
+        if std::path::Path::new(&p).exists() { Some(p) } else { None }
+    }) {
+        Some(f) => f,
+        None => {
+            eprintln!(
+                "[remux] ffmpeg が見つからないため VLC ready 化はスキップ。\
+                 PATH に ffmpeg を入れるか FFMPEG=/path/to/ffmpeg を指定してください。"
+            );
+            return;
+        }
+    };
+    let tmp = format!("{path}.vlcready.tmp");
+    let st = std::process::Command::new(&ffmpeg)
+        .args([
+            "-v", "error", "-y",
+            // 壊れた DTS を無視して PTS を生成する（実測: そのままでは
+            // `Timestamp conversion failed` で VLC が止まる）。
+            "-fflags", "+genpts+igndts",
+            "-i", path,
+            "-c", "copy",
+            // バッファ溜めを無効化し低遅延にする。
+            "-muxdelay", "0",
+            "-f", "mpegts",
+            &tmp,
+        ])
+        .status();
+    match st {
+        Ok(s) if s.success() => {
+            match std::fs::rename(&tmp, path) {
+                Ok(()) => {
+                    let n = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                    eprintln!(
+                        "[remux] VLC ready 化完了: {} バイト（ffmpeg -c copy）",
+                        n
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[remux] 差し替えに失敗: {e}（{tmp} に書き出し済み）");
+                }
+            }
+        }
+        _ => {
+            eprintln!("[remux] ffmpeg remux に失敗。元の生 TS のまま残す。");
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
 }

@@ -13,6 +13,9 @@ use std::sync::Arc;
 
 /// 固定FFT長のOFDM復調器（プランを使い回す）。
 pub struct OfdmDemod {
+    /// 直近 `reacquire_boundary` の peak の分数部（サンプル）。
+    /// `reacquire_boundary` は `&self` なので、内部状態は `Cell` で持つ。
+    sub_peak_frac: std::cell::Cell<f32>,
     pub(crate) fft: Arc<dyn Fft<f32>>,
     pub(crate) n: usize,
 }
@@ -21,6 +24,7 @@ impl OfdmDemod {
     pub fn new(fft_len: usize) -> Self {
         let mut planner = FftPlanner::<f32>::new();
         Self {
+            sub_peak_frac: std::cell::Cell::new(0.0),
             fft: planner.plan_fft_forward(fft_len),
             n: fft_len,
         }
@@ -134,7 +138,7 @@ impl OfdmDemod {
     ///
     /// 長窓は強いが、絶対最大値を取ると別のシンボル境界を掴む（実測で
     /// Δ = 16〜21 シンボル）。しかし漂移（実 fs 1015873.002204 と指定
-    /// 1015873 の差 ≈0.0022 サンプル/シンボル）は 800 シンボルで 1.9
+    /// 1015873 の差 ≈2.5e-6 サンプル/シンボル）は 800 シンボルで 1.9
     /// サンプルにしかならないので、**期待位置の近傍にある peak が真の境界**。
     ///
     /// 返り値は `(境界位置, メトリクス)`。近傍に peak がなければ `None`
@@ -172,7 +176,12 @@ impl OfdmDemod {
             .unwrap_or(TOL_DEFAULT);
         // offset 0..tol の範囲で、局所最大値のうち metric が最も高い peak を選ぶ。
         // 単調増加区間（端）を選んでしまわないよう、両隣と比べて局所最大を要求する。
+        // `best_d` は「局所最大かつ v >= 0.2」の peak の curve 内インデックス。
+        // 補間 (`parabolic_peak_offset`) にも**同じ d** を使う。別々に
+        // 絶対最大を探すと peak 食指がずれて、サブサンプル値が別の peak の
+        // ものになってしまう（実測ミス 1）。
         let mut best: Option<(usize, f32)> = None;
+        let mut best_d = 0usize;
         for d in 0..=tol.min(curve.len() - 1) {
             let v = curve[d];
             if v < 0.2 {
@@ -183,10 +192,32 @@ impl OfdmDemod {
             if v >= left && v >= right {
                 if best.map_or(true, |(_, bv)| v > bv) {
                     best = Some((lo + d, v));
+                    best_d = d;
                 }
             }
         }
+        // 診断: 整数 peak だけでは分数境界を復元できない（呼び出し側の
+        // `exact - exact.round()` が必ず 0 になる）。パラボリック補間で
+        // サブサンプル peak を取り出す。`ISDBT_SUBPEAK=0` で無効化。
+        //
+        // 返り値を `(usize, f32)` → `(usize, f32, f64)` に変えて
+        // 呼び出し側が `pos + frac` を使えるようにする。既存 API を壊さないよう、
+        // ここでは内部フラグをesselに持つだけで、`reacquire_boundary_sub()` を
+        // 別途公開する。
+        // 補間も同じ `best_d` を使う。δ は「頂点が整数位置より右に δ」の意味。
+        let frac_val = match best {
+            Some(_) if subpeak_enabled() => {
+                crate::sync::parabolic_peak_offset(&curve, best_d) as f32
+            }
+            _ => 0.0,
+        };
+        self.sub_peak_frac.set(frac_val);
         best
+    }
+
+    /// サブサンプル peak 位置の分数部（`reacquire_boundary` 呼び出し後に有効）。
+    pub fn sub_peak_frac(&self) -> f32 {
+        self.sub_peak_frac.get()
     }
 
     /// 1シンボルを復調しつつ、次のシンボル境界をCP相関で更新する。
@@ -205,13 +236,13 @@ impl OfdmDemod {
     /// したがって 1 シンボル窓で探索すると `.filter(|e| e.metric > 0.2)` が
     /// ほぼ全シンボルで失敗し、`unwrap_or(expected)` にフォールバックしていた。
     /// その結果境界が固定 1152 ずつ進み、実 fs（1015873.002204）と指定 fs
-    /// （1015873）の差 ≈0.0022 サンプル/シンボルが累積して、ライブ入力では
+    /// （1015873）の差 ≈2.5e-6 サンプル/シンボルが累積して、ライブ入力では
     /// 約 2000 RS ブロック（約 7 秒）で境界が破綻し出力が恒久停止した。
     ///
     /// 正しい設計は**周期的な長窓再同期**にすること。`reacquire_every` シンボル
     /// ごとに 1M サンプル窓で CP 探索し、間のシンボルはその結果の周期
     /// `LONG_WINDOW_SYMS * sym` で等間隔に詰める。長窓が実 fs を正しく反映した
-    /// のでその間の累積ドリフトは 0.0022 × 868 ≈ 1.9 サンプルに収まり、
+    /// のでその間の累積ドリフトは 2.5e-6 × 868 ≈ 1.9 サンプルに収まり、
     /// 短窓の探索半径内で追従できる。
     pub fn demod_one_tracked(
         &self,
@@ -222,7 +253,7 @@ impl OfdmDemod {
         radius: usize,
     ) -> Option<(Vec<Complex32>, usize)> {
         // 分数境界オフセットを外から上書きできるようにする。
-        // 実 fs 1015873.002204 と指定 1015873 の差は 0.0022 サンプル/シンボル。
+        // 実 fs 1015873.002204 と指定 1015873 の差は 2.5e-6 サンプル/シンボル。
         // 整数サンプル境界に丸め続けると系統誤差が蓄積して等化器のタップが
         // 合わず、RS は 100% でも H.264 ビットが一部化ける
         // （実測 2026-09-26: 保存 IQ で MB エラー 1 件/10 秒、ライブで
@@ -231,6 +262,10 @@ impl OfdmDemod {
     }
 
     /// `frac` は `expected` に加える分数サンプル位置（0.0〜1.0）。
+    ///
+    /// **返り値の `next` に `frac` 分の繰り上がりを持たせるには**
+    /// [`Self::demod_one_tracked_frac_carry`] を使う。こちらは後方互換のため
+    /// 繰り上がりなし（`next = start + sym`、厳密整数）のまま。
     pub fn demod_one_tracked_frac(
         &self,
         r: &[Complex32],
@@ -284,6 +319,101 @@ impl OfdmDemod {
     /// CPを飛ばして有効N点をFFT・fftshift。CFO位相は**シンボルローカル**（m=0..N）で、
     /// シンボル間の定数位相差は後段の[`crate::equalize`]（SPで毎シンボルH推定）が吸収する。
     /// 返り値は長さ`fft_len`のfftshift済みスペクトル。
+    /// [`Self::demod_one_tracked_frac`] + 分数キャリー。
+    ///
+    /// `carry` は「持ち越している端数サンプル」。返り値に `(next, new_carry)`:
+    /// ```text
+    /// total     = carry + frac;
+    /// step      = floor(total);
+    /// carry'    = total - step;
+    /// next      = start + step + sym;
+    /// ```
+    ///
+    /// **これが無いと何が壊れるか**（実測 2026-09-27）:
+    /// `demod_one_tracked_frac` は `frac` を FFT 窓の**線形補間**にしか使わず、
+    /// `next = start + sym`（厳密整数）で返す。そのため端数は毎シンボル捨てられ、
+    /// 探索の基準が常に整数サンプルに戻る。実 fs と指定 fs の差
+    /// 2.5e-6 サンプル/シンボルは `next` に反映されず、探索半径 8 の内側で
+    /// 累積し、2000 シンボル程度（≒7 秒、≒64 RS ブロック）で破綻する。
+    /// 実測の drop 0.2% → 90.4%（199 秒）がこれに一致する。
+    pub fn demod_one_tracked_frac_carry(
+        &self,
+        r: &[Complex32],
+        expected: usize,
+        gi: GuardInterval,
+        cfo_subcarriers: f32,
+        radius: usize,
+        frac: f32,
+        carry: f32,
+    ) -> Option<(Vec<Complex32>, usize, f32)> {
+        let n = self.n;
+        let l = gi.cp_len(n);
+        let sym = n + l;
+        let radius = radius.min(16);
+        if expected + sym + radius > r.len() {
+            return None;
+        }
+        let lo = expected.saturating_sub(radius);
+        let hi = (expected + sym + radius).min(r.len());
+        let start = crate::sync::estimate_symbol_sync(&r[lo..hi], n, gi)
+            .filter(|e| e.metric > 0.2)
+            .map(|e| lo + e.symbol_start)
+            .unwrap_or(expected);
+        if start + sym > r.len() {
+            return None;
+        }
+        // 符号の向きは `ISDBT_CARRIESIGN` で反転できる。
+        //
+        // `frac` は `demod_one_tracked_frac` 側で FFT 窓の**線形補間**に
+        // 使われる。実測 2026-09-27: `+frac` で繰り上げると全ブロックが
+        // 訂正不能（100%）になったが、これは符号の取り違えであり、仮説の
+        // 反証ではない（`frac` が BER を左右する量であることは実証された）。
+        // 線形補間では窓の起点を**右**にずらす百分率として働くので、
+        // 繰り上がりも逆向きが整合すると考えられる。`ISDBT_CARRIESIGN=-1` で
+        // 反転して検証する。既定 `+1` は「線形補間と同じ向き」。
+        let csgn: f32 = match std::env::var("ISDBT_CARRIESIGN") {
+            Ok(v) => v.parse().unwrap_or(1.0),
+            Err(_) => 1.0,
+        };
+        let total = carry + csgn * frac;
+        let step = total.floor();
+        let new_carry = total - step;
+        // `start` は **CP 先頭**。FFT 窓は CP を飛ばした `start + l` から始まる。
+        // 繰り上がり分 `step` だけ **`l` の後**に加える（最初の実装は
+        // `start + step` として `l` を落としており、`step = 0` でも窓が 128
+        // サンプル早まり、SP 位相が反転して全ブロック訂正不能 = 100% になっていた）。
+        let base_i = start as isize + step as isize + l as isize;
+        if base_i < 0 || base_i + n as isize >= r.len() as isize {
+            return None;
+        }
+        let base = base_i as usize;
+        let w0 = 1.0 - new_carry;
+        let w1 = new_carry;
+        let mut buf = vec![Complex32::new(0.0, 0.0); n];
+        let w = Complex32::from_polar(1.0, -2.0 * PI * cfo_subcarriers / (n as f32));
+        let mut ph = Complex32::new(1.0, 0.0);
+        for k in 0..n {
+            let a = r[base + k];
+            let b = if base + k + 1 < r.len() { r[base + k + 1] } else { a };
+            buf[k] = (a * w0 + b * w1) * ph;
+            ph *= w;
+        }
+        self.fft.process(&mut buf);
+        let half = n / 2;
+        let scale = 1.0 / (n as f32).sqrt();
+        let mut spec = vec![Complex32::new(0.0, 0.0); n];
+        for k in 0..n {
+            spec[(k + half) % n] = buf[k] * scale;
+        }
+        // `next` は次のシンボルの **CP 先頭**。base (= start + l + step) から
+        // 戻るため `base_i - l + sym`。
+        let next_i = start as isize + step as isize + sym as isize;
+        if next_i < 0 || next_i as usize + radius >= r.len() {
+            return None;
+        }
+        Some((spec, next_i as usize, new_carry))
+    }
+
     pub fn demod_one(
         &self,
         r: &[Complex32],
@@ -311,4 +441,9 @@ impl OfdmDemod {
         }
         spec
     }
+}
+
+/// サブサンプル peak 補間を有効にするか（`ISDBT_SUBPEAK=1`、既定無効）。
+pub fn subpeak_enabled() -> bool {
+    std::env::var("ISDBT_SUBPEAK").map(|v| v != "0").unwrap_or(false)
 }

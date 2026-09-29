@@ -90,6 +90,52 @@ pub fn estimate_symbol_sync(
     Some(best)
 }
 
+/// メトリクス peak の**サブサンプル**位置をパラボリック補間で求める。
+///
+/// # なぜ必要か
+///
+/// [`SyncEstimate::symbol_start`] と [`metric_curve`] はどちらも整数格子
+/// (`usize`) なので、サンプルより細かい境界位置を表現できない。そのため
+/// 呼び出し側の
+/// ```text
+/// exact = pos as f64 - cur as f64;      // 必ず整数
+/// boundary_frac = exact - exact.round(); // 必ず 0.0
+/// ```
+/// が恒久的に 0 になり、境界ドリフトの分数部分が一切補正されない
+/// （実測 2026-09-27: `boundary_frac` は前半・後半とも全期間 `0.0000`）。
+///
+/// メトリクスは peak 付近で滑らかな 2 次曲線を描くので、
+/// `M(d-1), M(d), M(d+1)` の 3 点から頂点の小数位置を復元できる:
+/// ```text
+/// δ = 0.5 * (M(d-1) - M(d+1)) / (M(d-1) - 2*M(d) + M(d+1))
+/// pos_frac = d + δ        (δ ∈ [-0.5, 0.5])
+/// ```
+///
+/// # 注意
+///
+/// これは**CP 相関メトリクスの peak 位置**であり、真の信号境界の不偏推定では
+/// ない。SNR が低い-domain では peak が平坦化して δ が過大になることがある
+/// ので、呼び出し側で範囲クランプすること。
+pub fn parabolic_peak_offset(curve: &[f32], d: usize) -> f64 {
+    if d == 0 || d + 1 >= curve.len() {
+        return 0.0;
+    }
+    let ym = curve[d - 1] as f64;
+    let y0 = curve[d] as f64;
+    let yp = curve[d + 1] as f64;
+    let den = ym - 2.0 * y0 + yp;
+    if den.abs() < 1e-12 {
+        return 0.0;
+    }
+    let delta = 0.5 * (ym - yp) / den;
+    // 物理的に [-0.5, 0.5] のはず。異常値（平坦な peak など）は 0 に丸める。
+    if !delta.is_finite() || delta.abs() > 0.5 {
+        0.0
+    } else {
+        delta
+    }
+}
+
 /// 全位置の正規化メトリクス `M(d)=|γ(d)|/Φ(d)` を返す（診断・可視化用）。
 ///
 /// 長さは `r.len() - N - L + 1`。実信号でCP相関ピークが

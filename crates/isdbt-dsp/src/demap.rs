@@ -22,7 +22,38 @@ pub fn qpsk_soft(c: Complex32) -> [f32; 2] {
     // 非有限（等化で H≈0 → Y/H が Inf/NaN。ライブの弱搬送波で発生）は erasure(0) に。
     // 併せて振幅をクランプし、Viterbi のメトリクス暴走・NaN 伝播を防ぐ。
     let s = |x: f32| if x.is_finite() { x.clamp(-8.0, 8.0) } else { 0.0 };
-    [s(-c.im), s(-c.re)]
+    let out = [s(-c.im), s(-c.re)];
+    // 診断: クランプ（±8.0）に張り付いた回数と、非有限（erasure）になった回数。
+    // 飽和が増えると soft 平均は上がるが解像度が失われ、トレリスのパス間
+    // メトリック差が縮む（実測 2026-09-26: soft は改善するのに BER が 40 倍悪化）。
+    if out[0].abs() >= 8.0 { SAT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+    if out[1].abs() >= 8.0 { SAT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+    if !c.re.is_finite() || !c.im.is_finite() {
+        NAN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    TOTAL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    out
+}
+
+/// 診断: `qpsk_soft` のクランプ飽和回数（静的、診断用）。
+static SAT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 診断: 非有限（erasure）になった回数。
+static NAN_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 診断: `qpsk_soft` 呼び出し総数。
+static TOTAL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 診断: (総呼び出し数, クランプ飽和数, 非有限数) を返す。
+pub fn dbg_saturation() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (TOTAL_COUNT.load(Relaxed), SAT_COUNT.load(Relaxed), NAN_COUNT.load(Relaxed))
+}
+
+/// 診断: カウンタをゼロに戻す。
+pub fn dbg_saturation_reset() {
+    use std::sync::atomic::Ordering::Relaxed;
+    TOTAL_COUNT.store(0, Relaxed);
+    SAT_COUNT.store(0, Relaxed);
+    NAN_COUNT.store(0, Relaxed);
 }
 
 /// QPSKビットデインターリーバ（ソフト値）。キャリアを順に流し込む単一遅延線。

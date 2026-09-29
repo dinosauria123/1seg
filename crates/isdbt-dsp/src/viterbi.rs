@@ -208,6 +208,10 @@ pub struct ViterbiStreaming {
     /// トレースバック済み・未消費の情報ビット。
     out: std::collections::VecDeque<u8>,
     n: usize, // 処理済みステップ数
+    /// 診断: (ステップ数, 最良-最悪 metric 乖離, 有限状態数, 出力キュー長)。
+    ///
+    /// 乗離が時間とともに狭まっていればトレリスが「判断不能」に落ちている。
+    pub dbg: (u64, f32, usize, usize),
 }
 
 impl ViterbiStreaming {
@@ -233,7 +237,31 @@ impl ViterbiStreaming {
             back: vec![0u8; depth * N_STATES],
             out: std::collections::VecDeque::with_capacity(depth),
             n: 0,
+            dbg: (0, 0.0, 0, 0),
         }
+    }
+
+    /// トレリス状態とトレースバック履歴を初期状態に戻す。
+    ///
+    /// 実測 2026-09-26: 1seg の復調を長時間走らせると、`n`（処理済みステップ数）
+    /// とトレリスが実際の星座状態からずれて RS 訂正不能が累積する（IQ を分割
+    /// して singly デコードすると 0.3% なのに対し、連結すると 24〜58%）。
+    /// `n` はリングバッファのインデックスとしてだけ必要なので戻してよい。
+    pub fn reset(&mut self) {
+        for (i, m) in self.metric.iter_mut().enumerate() {
+            *m = if i == 0 { 0.0 } else { f32::NEG_INFINITY };
+        }
+        for m in self.next.iter_mut() {
+            *m = f32::NEG_INFINITY;
+        }
+        for b in self.prev.iter_mut() {
+            *b = 0;
+        }
+        for b in self.back.iter_mut() {
+            *b = 0;
+        }
+        self.out.clear();
+        self.n = 0;
     }
 
     /// 母符号ソフト対 `(r1, r2)` を1ステップ投入し、情報ビットが1つ取れたら返す。
@@ -273,6 +301,20 @@ impl ViterbiStreaming {
                     *m -= mx;
                 }
             }
+        }
+        // 診断: 正規化後の metric 乖離（最良 0 − 最悪）と有限状態数。
+        // 乗離が狭まっていればトレリスの「判断力」が落ちている。
+        if self.n % 64 == 0 {
+            let mut lo = f32::INFINITY;
+            let mut n_fin = 0usize;
+            for &m in self.next.iter() {
+                if m.is_finite() {
+                    if m < lo { lo = m; }
+                    n_fin += 1;
+                }
+            }
+            let spread = if lo.is_finite() { -lo } else { f32::NAN };
+            self.dbg = (self.n as u64, spread, n_fin, self.out.len());
         }
         std::mem::swap(&mut self.metric, &mut self.next); // 確保なしで入れ替え
         self.n += 1;
