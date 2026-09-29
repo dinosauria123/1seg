@@ -124,7 +124,10 @@ fn reset_frames() -> usize {
     if b == 0 || b == usize::MAX { usize::MAX } else { (b / 64).max(1) }
 }
 
-const RESET_BLK: usize = 0; // 0 = 無効（Pipe::resync は Viterbi を壊す。上記コメント参照）
+const RESET_BLK: usize = 0;
+
+/// 1 ISDB-T フレーム = 204 OFDM シンボル（TMCC が全帯域共通で 1 フレームを通知する）。
+const TMCC_SYMS_PER_FRAME: usize = 204; // 0 = 無効（Pipe::resync は Viterbi を壊す。上記コメント参照）
 const PRBS_INIT: u16 = 0xa9;
 
 /// bin offset 探索半径。capture ごとに数 bin のズレが出るので TMCC 同期で決める。
@@ -1011,6 +1014,10 @@ struct Pipe {
     pub dbg_depu_all: Vec<(usize, usize)>,
     pub t_max_us: u64,
     pub t_n: usize,
+    /// TMCC フレーム境界（204 シンボルごと）の RS ブロック位置。
+    pub tmcc_frame_pos: Vec<usize>,
+    /// 現在の TMCC フレーム内でのシンボル数（0..204）。
+    pub tmcc_sym_count: usize,
     /// 訂正不能が連続して `BURST_THRESHOLD` 個に達したイベント。
     ///
     /// `process()` が立つので、デコーダ側が `feed()` の戻り値を受けて
@@ -1218,6 +1225,8 @@ impl Pipe {
             t_sum_us: 0,
             t_max_us: 0,
             t_n: 0,
+            tmcc_frame_pos: Vec::new(),
+            tmcc_sym_count: 0,
             burst_raised: false,
             dbg_bits: 0,
             dbg_bytes: 0,
@@ -2033,6 +2042,20 @@ impl Pipe {
         }
         self.mother.drain(0..pairs * 2);
 
+        // 診断: TMCC フレーム境界（1 ISDB-T フレーム = 204 シンボル）の
+        // RS ブロック位置を記録する。
+        //
+        // gr-isdbt `tmcc_decoder_1seg_impl.cc` は PRBS リセットの基準を
+        // **TMCC 同期語が現れる位置**（`d_frame_end`）から作る。我々は
+        // RS ブロック番号の 64 周期でリセットしており、この 2 つが
+        // 一致する保証はない。TMCC 境界と 64 周期がずれていれば、
+        // 後半で PRBS 位相がずれて RS が壊れる（観測された症状）。
+        self.tmcc_sym_count += 1;
+        if self.tmcc_sym_count >= TMCC_SYMS_PER_FRAME {
+            self.tmcc_sym_count = 0;
+            self.tmcc_frame_pos.push(self.rs_asm.rs_blocks_seen as usize);
+        }
+
         // 診断: 1 シンボルの所要時間を集計する。CPU 律速（熱スロットリング含む）
         // なら時間がブロック数に比例して伸びる。復調品質低下ならフラット。
         let dt = _t_start.elapsed().as_micros() as u64;
@@ -2763,6 +2786,11 @@ impl StreamingDecoder {
     /// 診断: `self.buf.len()`（バッファ長）。
     pub fn dbg_buf_len(&self) -> u64 { self.buf.len() as u64 }
     /// 診断: 全ブロックの `(ブロック番号, depu_pos % 4)`。
+    /// TMCC フレーム境界の RS ブロック位置。
+    pub fn dbg_tmcc_frame_pos(&self) -> Vec<usize> {
+        self.pipe.as_ref().map(|p| p.tmcc_frame_pos.clone()).unwrap_or_default()
+    }
+
     pub fn dbg_depu_all(&self) -> Vec<(usize, usize)> {
         self.pipe.as_ref().map(|p| p.dbg_depu_all.clone()).unwrap_or_default()
     }

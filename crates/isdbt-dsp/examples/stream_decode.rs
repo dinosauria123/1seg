@@ -547,6 +547,21 @@ fn main() {
     // 診断: 連続訂正不能（バースト）長の分布と最長値。
     // `BURST_THRESHOLD`=32 が発動条件なので、**32 を超えるバーストが
     // 1 つもなければ discontinuity 注入は一度も起作用していない**。
+    // 診断: TMCC フレーム境界の実測ブロック間隔。
+    //
+    // gr-isdbt `tmcc_decoder_1seg_impl.cc` は PRBS リセットの基準を
+    // **TMCC 同期語が現れる位置**（`d_frame_end`）から作る。我々は
+    // RS ブロック番号の 64 周期でリセットしており、この 2 つが
+    // 一致する保証はない。ずれれば後半で PRBS 位相がずれて RS が壊れる。
+    if std::env::var("ISDBT_TMCCFRM").is_ok() {
+        let h = dec.dbg_tmcc_frame_pos();
+        let mut gaps = String::new();
+        for w in h.windows(2) {
+            gaps.push_str(&format!("{} ", w[1] - w[0]));
+        }
+        eprintln!("[tmccfrm] 境界数={} 先頭={:?}", h.len(), h.first());
+        eprintln!("[tmccfrm] ブロック間隔 = {}", gaps);
+    }
     if std::env::var("ISDBT_BURST").is_ok() {
         let (h, mx) = dec.dbg_drop_burst();
         let mut out = String::new();
