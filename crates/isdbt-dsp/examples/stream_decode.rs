@@ -192,13 +192,19 @@ fn main() {
             let (m4u, m4a) = (dec.dbg_sym_mod4_used(), dec.dbg_sym_mod4_actual());
             // TS 同期バイト 0x47 の保持率 = byte 整列が保たれているか。
             let (syc, sy) = dec.dbg_rs_sync();
+            // Viterbi トレリスの内部状態。
+            // `vspread` = 最良-最酷 metric 乖離（トレリスの「判断力」）
+            // `vfin`   = 有限状態数（64 全部生きていれば健全）
+            // これらは Viterbi 内部の劣化を検出する唯一の窓。
+            let (vn, vsp, vfin, vq) = dec.dbg_viterbi();
+            let _ = vn;
             let dp = {
                 let v = dec.dbg_depu_phase();
                 let tail: Vec<(usize, usize)> = v.iter().rev().take(4).rev().copied().collect();
                 tail.iter().map(|(b, p)| format!("{b}:{p}")).collect::<Vec<_>>().join(",")
             };
             eprintln!(
-                "[dbg] in={n}B out={}B locked={} backlog={}sym 訂正blk={rc} 訂正bit={rb} 総blk={seen} drop={drop} mis={mis} symerr={se} symerr/blk={spb:.2} fail={fr:?} depu={dp:?} soft={sf:.4} h={havg:.2} m4={m4u}/{m4a} sync={sy}/{syc}",
+                "[dbg] in={n}B out={}B locked={} backlog={}sym 訂正blk={rc} 訂正bit={rb} 総blk={seen} drop={drop} mis={mis} symerr={se} symerr/blk={spb:.2} fail={fr:?} depu={dp:?} soft={sf:.4} h={havg:.2} m4={m4u}/{m4a} sync={sy}/{syc} vspread={vsp:.2} vfin={vfin} vq={vq}",
                 ts.len(),
                 dec.is_locked(),
                 dec.backlog_syms(),
