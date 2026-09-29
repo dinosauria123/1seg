@@ -376,6 +376,10 @@ struct RsBlockAssembler {
     ///
     /// これが崩れていれば「soft は正しいのに RS が壊れる」原因が
     /// 整列のズレであり、Viterbi 自体には無実。
+    /// 連続訂正不能長の分布（添字 = 連続長-1、値 = 発生回数）。
+    pub drop_burst_hist: [u64; 64],
+    /// 最長バースト。
+    pub drop_burst_max: u64,
     pub rs_sync_ok: u64,
     pub rs_seen_decoded: u64,
     /// 訂正を要した RS ブロック数（復調 bit error の指標）。
@@ -442,7 +446,7 @@ const BURST_THRESHOLD: usize = 32;
 
 impl RsBlockAssembler {
     fn new(phase: usize, reset_off: usize) -> Self {
-        Self { buffer: Vec::with_capacity(TSP), phase, reset_off, prbs: EnergyPrbs::with_init(PRBS_INIT), block_idx: 0, rs_sync_ok: 0, rs_seen_decoded: 0, rs_corrected: 0, rs_bit_errors: 0, rs_symbol_errors: 0, rs_fail_reasons: [0; 4], rs_dropped: 0, rs_miscorrected: 0, rs_blocks_seen: 0, drop_burst: 0, burst_raised: false, drop_by_mod64: [0u32; 64], drop_by_mod256: [0u32; 256], drop_seen_blocks: 0 }
+        Self { buffer: Vec::with_capacity(TSP), phase, reset_off, prbs: EnergyPrbs::with_init(PRBS_INIT), block_idx: 0, drop_burst_hist: [0u64; 64], drop_burst_max: 0, rs_sync_ok: 0, rs_seen_decoded: 0, rs_corrected: 0, rs_bit_errors: 0, rs_symbol_errors: 0, rs_fail_reasons: [0; 4], rs_dropped: 0, rs_miscorrected: 0, rs_blocks_seen: 0, drop_burst: 0, burst_raised: false, drop_by_mod64: [0u32; 64], drop_by_mod256: [0u32; 256], drop_seen_blocks: 0 }
     }
 
     /// 復号できた RS ブロックを返す。訂正不能なブロックは**出力しない**
@@ -549,6 +553,22 @@ impl RsBlockAssembler {
                     // それが H.264 の自己修復の仕組みに最も正しい。
                     self.rs_dropped += 1;
                     self.drop_burst += 1;
+                    // 診断: 連続訂正不能（バースト）の**長さ分布**。
+                    //
+                    // `BURST_THRESHOLD`=32 は「1 フレーム(64ブロック)の半分」で
+                    // _detection 基準としてimba された値だが、**実測のバースト長
+                    // より長い可能性**があり、その場合 discontinuity 注入が
+                    // 一度も発動せず、H.264 の GOP 破綻を防げない。
+                    //
+                    // I フレームは 2 秒 = 128 ブロック周期なので、バーストが
+                    // I フレームを含む長さに達すれば画像が落ちる。よって
+                    // 「何個連続したら I フレームを含むか」が本質的な閾値。
+                    if self.drop_burst as usize <= 64 {
+                        self.drop_burst_hist[self.drop_burst - 1] += 1;
+                    }
+                    if self.drop_burst as u64 > self.drop_burst_max {
+                        self.drop_burst_max = self.drop_burst as u64;
+                    }
                     // 診断: どの block が落ちたかを modulo 64/256 で記録する。
                     // 1 [dbg] 間隔(214 blk)あたり 36 個が常に落ちるので、
                     // 特定の block 位置が構造的に落ちている（commutator /
@@ -2710,6 +2730,14 @@ impl StreamingDecoder {
     }
 
     /// 診断: 直近 2048 個の (完了ブロック数, `depu_pos % 4`)。
+    /// 診断: `(連続訂正不能長の分布, 最長バースト)`。
+    pub fn dbg_drop_burst(&self) -> ([u64; 64], u64) {
+        self.pipe
+            .as_ref()
+            .map(|p| (p.rs_asm.drop_burst_hist, p.rs_asm.drop_burst_max))
+            .unwrap_or(([0; 64], 0))
+    }
+
     pub fn dbg_depu_phase(&self) -> Vec<(usize, usize)> {
         self.pipe.as_ref().map(|p| p.dbg_depu_at_block.clone()).unwrap_or_default()
     }

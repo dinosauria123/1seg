@@ -544,6 +544,31 @@ fn main() {
         }
         eprintln!("[hist] ブロック数={} {}", n, s);
     }
+    // 診断: 連続訂正不能（バースト）長の分布と最長値。
+    // `BURST_THRESHOLD`=32 が発動条件なので、**32 を超えるバーストが
+    // 1 つもなければ discontinuity 注入は一度も起作用していない**。
+    if std::env::var("ISDBT_BURST").is_ok() {
+        let (h, mx) = dec.dbg_drop_burst();
+        let mut out = String::new();
+        for (i, c) in h.iter().enumerate() {
+            if *c > 0 {
+                out.push_str(&format!("{}:{} ", i + 1, c));
+            }
+        }
+        let mut ge = [0u64; 5];
+        for (i, c) in h.iter().enumerate() {
+            let len = i + 1;
+            for (k, thr) in [8usize, 16, 24, 32, 48].iter().enumerate() {
+                if len >= *thr {
+                    ge[k] += c;
+                }
+            }
+        }
+        eprintln!(
+            "[burst] max={} dist={} >=8:{} >=16:{} >=24:{} >=32:{} >=48:{}",
+            mx, out, ge[0], ge[1], ge[2], ge[3], ge[4]
+        );
+    }
     // 診断: 全ブロックの `depu_pos % 4`。**復号不能ブロックも含む**ので、
     // 劣化域（drop 100%）でも値が更新され続ける。64 ブロック周期で戻るはず。
     if std::env::var("ISDBT_DEPUALL").is_ok() {
