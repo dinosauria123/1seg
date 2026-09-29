@@ -190,13 +190,15 @@ fn main() {
             // `m4` = 機械的に決めた sym_mod4 と、信号から測った実際の位相。
             // **不一致なら pilot 配置が 1 象限ずれ**て等化器が「健全な誤り」を出す。
             let (m4u, m4a) = (dec.dbg_sym_mod4_used(), dec.dbg_sym_mod4_actual());
+            // TS 同期バイト 0x47 の保持率 = byte 整列が保たれているか。
+            let (syc, sy) = dec.dbg_rs_sync();
             let dp = {
                 let v = dec.dbg_depu_phase();
                 let tail: Vec<(usize, usize)> = v.iter().rev().take(4).rev().copied().collect();
                 tail.iter().map(|(b, p)| format!("{b}:{p}")).collect::<Vec<_>>().join(",")
             };
             eprintln!(
-                "[dbg] in={n}B out={}B locked={} backlog={}sym 訂正blk={rc} 訂正bit={rb} 総blk={seen} drop={drop} mis={mis} symerr={se} symerr/blk={spb:.2} fail={fr:?} depu={dp:?} soft={sf:.4} h={havg:.2} m4={m4u}/{m4a}",
+                "[dbg] in={n}B out={}B locked={} backlog={}sym 訂正blk={rc} 訂正bit={rb} 総blk={seen} drop={drop} mis={mis} symerr={se} symerr/blk={spb:.2} fail={fr:?} depu={dp:?} soft={sf:.4} h={havg:.2} m4={m4u}/{m4a} sync={sy}/{syc}",
                 ts.len(),
                 dec.is_locked(),
                 dec.backlog_syms(),

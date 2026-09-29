@@ -366,6 +366,18 @@ struct RsBlockAssembler {
     reset_off: usize,
     prbs: EnergyPrbs,
     block_idx: usize,
+    /// 復号**できた**ブロック数と、そのうち先頭バイトが TS 同期 `0x47` だった数。
+    ///
+    /// 1seg の 1 TSD = 204 バイト = TS パケット 188 バイト + 16 バイト parity で、
+    /// descramble 後の先頭バイトは必ず `0x47`。したがって
+    /// 「同期バイトが一致したブロックの割合」は **byte 整列（commutator /
+    /// block_phase / BYTE_LATENCY / byte deinterleaver）が保たれているか**を
+    /// Viterbi の良否とは独立に判定できる。
+    ///
+    /// これが崩れていれば「soft は正しいのに RS が壊れる」原因が
+    /// 整列のズレであり、Viterbi 自体には無実。
+    pub rs_sync_ok: u64,
+    pub rs_seen_decoded: u64,
     /// 訂正を要した RS ブロック数（復調 bit error の指標）。
     rs_corrected: usize,
     /// 訂正を要したビット総数。
@@ -430,7 +442,7 @@ const BURST_THRESHOLD: usize = 32;
 
 impl RsBlockAssembler {
     fn new(phase: usize, reset_off: usize) -> Self {
-        Self { buffer: Vec::with_capacity(TSP), phase, reset_off, prbs: EnergyPrbs::with_init(PRBS_INIT), block_idx: 0, rs_corrected: 0, rs_bit_errors: 0, rs_symbol_errors: 0, rs_fail_reasons: [0; 4], rs_dropped: 0, rs_miscorrected: 0, rs_blocks_seen: 0, drop_burst: 0, burst_raised: false, drop_by_mod64: [0u32; 64], drop_by_mod256: [0u32; 256], drop_seen_blocks: 0 }
+        Self { buffer: Vec::with_capacity(TSP), phase, reset_off, prbs: EnergyPrbs::with_init(PRBS_INIT), block_idx: 0, rs_sync_ok: 0, rs_seen_decoded: 0, rs_corrected: 0, rs_bit_errors: 0, rs_symbol_errors: 0, rs_fail_reasons: [0; 4], rs_dropped: 0, rs_miscorrected: 0, rs_blocks_seen: 0, drop_burst: 0, burst_raised: false, drop_by_mod64: [0u32; 64], drop_by_mod256: [0u32; 256], drop_seen_blocks: 0 }
     }
 
     /// 復号できた RS ブロックを返す。訂正不能なブロックは**出力しない**
@@ -500,6 +512,13 @@ impl RsBlockAssembler {
             }
             match decoded {
                 Some(cw) => {
+                    // TS 同期バイトの保持率（byte 整列 sanity check）。
+                    // `cw[0]` は descramble 済みの TSD 先頭バイトで、
+                    // 仕様どおり必ず 0x47。
+                    self.rs_seen_decoded += 1;
+                    if cw[0] == 0x47 {
+                        self.rs_sync_ok += 1;
+                    }
                     // 訂正後に syndrome がまだ非ゼロなら「訂正したつもりが
                     // まだ壊れている」。Chien 検索の根取りこぼしや synd 計算の
                     // 向き違いがここに出る。0 でなければ出力を信用してはいけない。
@@ -2418,6 +2437,14 @@ impl StreamingDecoder {
     }
 
     /// 診断: 1 TSD あたりの degraded 数のヒストグラム（長さ 16）と総ブロック数。
+    /// 診断: `(復号できたブロック数, そのうち先頭が 0x47 の数)`。
+    pub fn dbg_rs_sync(&self) -> (u64, u64) {
+        self.pipe
+            .as_ref()
+            .map(|p| (p.rs_asm.rs_seen_decoded, p.rs_asm.rs_sync_ok))
+            .unwrap_or((0, 0))
+    }
+
     pub fn dbg_degraded_hist(&self) -> ([u64; 16], u64) {
         self.pipe
             .as_ref()
