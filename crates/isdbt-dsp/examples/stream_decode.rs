@@ -565,6 +565,13 @@ fn main() {
             let v2: String = vit.iter().map(|&b| if b != 0 { '1' } else { '0' }).collect();
             let hex = |v: &[u8]| v.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join("");
             std::fs::write(format!("{}.soft.txt", base), &s2).ok();
+            // 生の f32（オフライン再生用。量子化すると情報が失われる）
+            let f = dec.dump_soft_f32();
+            if !f.is_empty() {
+                let mut o = String::new();
+                for v in &f { o.push_str(&format!("{:.6} ", v)); }
+                std::fs::write(format!("{}.softf32.txt", base), o).ok();
+            }
             std::fs::write(format!("{}.vit.txt", base), &v2).ok();
             std::fs::write(format!("{}.byte.hex", base), hex(&byte)).ok();
             let blocks = dec.dump_blocks();

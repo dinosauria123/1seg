@@ -1104,6 +1104,7 @@ struct Pipe {
     pub dump_target: Option<u64>,
     /// 段別ダンプが有効か（`Pipe` 側フラグ、`rs_asm.dump_enabled` と対応）。
     pub dump_enabled: bool,
+    pub dump_soft_f32: Vec<f32>,
     pub dump_soft: Vec<u8>,
     pub dump_vit: Vec<u8>,
     pub dump_byte: Vec<u8>,
@@ -1319,7 +1320,7 @@ impl Pipe {
             t_n: 0,
             dump_target: None,
             dump_enabled: false,
-            dump_soft: Vec::new(),
+            dump_soft_f32: Vec::new(), dump_soft: Vec::new(),
             dump_vit: Vec::new(),
             dump_byte: Vec::new(),
             dump_capture: false,
@@ -1988,7 +1989,9 @@ impl Pipe {
                     if self.dump_soft.len() >= DUMP_RING {
                         self.dump_soft.drain(0..DUMP_RING / 4);
                     }
-                    self.dump_soft.push(if kept == 0.0 { 2 } else if kept > 0.0 { 1 } else { 0 });
+                    // 生の f32 値を保存する（量子化すると情報が失われ、
+                    // オフライン再生で原因を判別できなくなる）。
+                    self.dump_soft_f32.push(kept);
                 }
                 // order=1
                 loop {
@@ -2166,11 +2169,11 @@ impl Pipe {
         // 段別ダンプ: 対象ブロックの soft / vit を对齐して切り出す。
         if self.rs_asm.dump_enabled && self.rs_asm.rs_blocks_seen == self.rs_asm.dump_target {
             // Pipe のリングから対象ブロック分だけを取り出す。
-            let s_need = rs::N * 8 * 3 / 2;   // 母符号長 = 204*8*3/2
-            let v_need = rs::N * 8;             // 情報ビット長 = 204*8
-            let so = self.dump_soft.len().saturating_sub(s_need);
+            let s_need = rs::N * 8 * 3 / 2;
+            let v_need = rs::N * 8;
+            let so = self.dump_soft_f32.len().saturating_sub(s_need);
             let vo = self.dump_vit.len().saturating_sub(v_need);
-            self.dump_soft = self.dump_soft[so..].to_vec();
+            self.dump_soft_f32 = self.dump_soft_f32[so..].to_vec();
             self.dump_vit = self.dump_vit[vo..].to_vec();
         }
         self.tmcc_sym_count += 1;
@@ -2974,6 +2977,11 @@ impl StreamingDecoder {
             .as_ref()
             .map(|p| p.rs_asm.dump_byte_pre.clone())
             .unwrap_or_default()
+    }
+
+    /// 生の f32 soft 値（量子化前）。
+    pub fn dump_soft_f32(&self) -> Vec<f32> {
+        self.pipe.as_ref().map(|p| p.dump_soft_f32.clone()).unwrap_or_default()
     }
 
     pub fn dump_stages(&self) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
