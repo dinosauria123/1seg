@@ -143,17 +143,18 @@ const DUMP_RING: usize = 8192;
 /// 1 ステップ 2 値（X, Y）で **3456 値**。余裕をみて少し多めに取る。
 const RS_BLOCK_SOFT: usize = 3456;
 
-/// オフライン再現に必要な vit ビット数。
+/// 保持する**トレリスステップ数**。
 ///
-/// `ByteDeinterleaver` の遅延は `BI_M*BI_I*(BI_I-1) = 17*12*11 = 2244` バイト。
-/// 1 RS ブロック(204 バイト)ぶんを**出**すには、それより前に
-/// 2244 バイトぶんの vit (= 17952 ビット) が必要。
-/// さらに block_phase 分(最大 204 バイト)も足す。
-const VIT_RING_BITS: usize = 24_000;
+/// soft は 1 ステップあたり 2 値（X, Y）、vit は 1 ビット。
+/// リング長を「soft 値数」と「vit ビット数」で別々にすると
+/// **同じ時間窓にならない**（実測: soft 60000 値 = 30000 ステップ
+/// に対し vit 24000 ビットしかなく、比較対象がずれていた）。
+/// よってステップ数で единиц を決めて両者を揃える。
+const RING_STEPS: usize = 30_000;
 
 /// soft リングの保持長。vit の 3 倍（レート 2/3 + X/Y 対）を見込んで
 /// VIT_RING_BITS より大きめに取る。
-const VIT_RING_SOFT: usize = 60_000; // 0 = 無効（Pipe::resync は Viterbi を壊す。上記コメント参照）
+const VIT_RING_SOFT: usize = RING_STEPS * 2; // 0 = 無効（Pipe::resync は Viterbi を壊す。上記コメント参照）
 const PRBS_INIT: u16 = 0xa9;
 
 /// bin offset 探索半径。capture ごとに数 bin のズレが出るので TMCC 同期で決める。
@@ -1139,6 +1140,19 @@ struct Pipe {
     pub dump_map: Vec<(usize, usize)>,
     /// ブロック完了時にリング全体をスナップショットした soft。
     pub dump_soft_snap: Vec<f32>,
+    /// RS へ入ったバイトの絶対連番（診断用、リセットしない）。
+    pub rs_byte_abs: u64,
+    /// 各 RS バイトの出所 vit ビット位置（絶対）。
+    pub rs_byte_vitpos: Vec<u64>,
+    /// Viterbi 出力ビットの絶対連番。
+    pub vit_bits_out: u64,
+    /// 原子スナップショット時の `ByteDeinterleaver::idx`（絶対）。
+    ///
+    /// `push()` は `self.idx % BI_I` で分岐を選ぶため、idx=0 から
+    /// 始于 offline 再生では online と**別の分岐**にバイトが乗り、
+    /// 出力バイト列が一致しない（実測: 先頭 1 バイトだけ 0x47 で
+    /// 2 バイト目以降が全滅）。离线侧で idx を合わせる必要がある。
+    pub dump_deint_idx: usize,
     /// 対象ブロックの記録（soft, vit, byte が同一ブロック由来）。
     pub dump_atom: Option<(Vec<f32>, Vec<u8>, Vec<u8>)>,
     pub dump_soft: Vec<u8>,
@@ -1356,7 +1370,7 @@ impl Pipe {
             t_n: 0,
             dump_target: None,
             dump_enabled: false,
-            dump_soft_f32: Vec::new(), dump_map: Vec::new(), dump_soft_snap: Vec::new(), dump_atom: None, dump_soft: Vec::new(),
+            dump_soft_f32: Vec::new(), dump_map: Vec::new(), dump_soft_snap: Vec::new(), dump_atom: None, rs_byte_abs: 0, rs_byte_vitpos: Vec::new(), vit_bits_out: 0, dump_deint_idx: 0, dump_soft: Vec::new(),
             dump_vit: Vec::new(),
             dump_byte: Vec::new(),
             dump_capture: false,
@@ -2027,12 +2041,12 @@ impl Pipe {
                     }
                     // 生の f32 値を保存する（量子化すると情報が失われ、
                     // オフライン再生で原因を判別できなくなる）。
-                    if self.dump_enabled {
-                        // ダンプ中は**循環させない**。drain すると保存済み
-                        // カーソル（絶対位置）と現在のベクトル（スライディング
-                        // ウィンドウ）がずれ、切り出しが空になる（実測）。
-                        self.dump_soft_f32.push(kept);
-                    }
+                    // ここでは捕捉**しない**。`kept` は depuncture の
+                    // **前**の値で、Viterbi が受け取る `mother`（後）とは
+                    // 長さも内容が不一样（実測: kept=60000 に対し
+                    // mother=45000）。Viterbi と同一の値を取るには
+                    // `self.mother.push(...)` の直後に捕捉する。
+                    //
                 }
                 // order=1
                 loop {
@@ -2040,9 +2054,16 @@ impl Pipe {
                     self.depu_pos += 1;
                     if pat == 1 {
                         self.mother.push(kept);
+                        if self.dump_enabled {
+                            self.dump_soft_f32.push(kept);
+                        }
                         break;
                     } else {
                         self.mother.push(0.0);
+                        if self.dump_enabled {
+                            // punctured = erasure 0.0。Viterbi に渡す値と同一。
+                            self.dump_soft_f32.push(0.0);
+                        }
                     }
                 }
             }
@@ -2080,12 +2101,13 @@ impl Pipe {
                 None => continue,
             };
             if self.dump_enabled {
-                if self.dump_vit.len() >= VIT_RING_BITS {
-                    let ov = self.dump_vit.len() - VIT_RING_BITS;
+                if self.dump_vit.len() >= RING_STEPS {
+                    let ov = self.dump_vit.len() - RING_STEPS;
                     self.dump_vit.drain(0..ov);
                 }
                 self.dump_vit.push(bit & 1);
             }
+            self.vit_bits_out += 1;
             self.bit_acc = (self.bit_acc << 1) | (bit & 1);
             self.bit_cnt += 1;
             self.dbg_bits += 1;
@@ -2110,6 +2132,17 @@ impl Pipe {
             }
             self.deint_out_idx += 1;
             self.dbg_bytes_to_rs += 1;
+            // 診断: RS へ入ったバイトの**絶対連番**。原子スナップショットで
+            // 「この 204 バイトの出所」を厳密に特定するための基準点にする。
+            self.rs_byte_abs += 1;
+            if self.dump_enabled {
+                if self.rs_byte_vitpos.len() < 2_000_000 {
+                    self.rs_byte_vitpos.push(self.vit_bits_out);
+                }
+                // このバイトの出所 vit ビット位置（Viterbi 出力の絶対連番）。
+                // 1 バイト = 8 ビットなので `bit_acc` の繰り越しを無視して
+                // 累(add) カウンタで管理する。
+            }
             if self.dump_enabled {
                 // このバイトを消費した時点の soft / vit カーソル。
                 // 204 バイトが揃ったとき、この範囲が**そのブロックの**
@@ -2149,6 +2182,11 @@ impl Pipe {
                 self.dbg_depu_all
                     .push((self.rs_asm.rs_blocks_seen as usize, self.depu_pos % 4));
             }
+            // `deint_out_idx` は RS へ出たバイト数の累積。
+            // あるバイトが RS に入ったとき、その出所の vit ビットは
+            // 現在の vit 位置から (BYTE_LATENCY + block_phase) * 8 だけ前。
+            // この量を引いてスナップショットすれば、その 204 バイトの
+            // **出所**の vit 区間が得られる。
             let _seen_before = self.rs_asm.rs_blocks_seen;
             let (blocks, burst) = self.rs_asm.feed(&[o]);
             // 原子的な 1 ブロック分の記録。
@@ -2161,21 +2199,49 @@ impl Pipe {
             if self.dump_enabled
                 && self.rs_asm.rs_blocks_seen == self.rs_asm.dump_target
                 && self.dump_soft_f32.len() >= VIT_RING_SOFT
-                && self.dump_vit.len() >= VIT_RING_BITS
+                && self.dump_vit.len() >= RING_STEPS - 128
                 && !self.rs_asm.dump_byte.is_empty()
             {
-                // リング（RS_BLOCK_SOFT 個の soft 値）が**そのまま**
-                // このブロックの soft になる。
-                let atom_soft: Vec<f32> = self.dump_soft_f32.clone();
-                let atom_vit: Vec<u8> = self.dump_vit.clone();
-                let (ns, nv) = (atom_soft.len(), atom_vit.len());
-                if ns < VIT_RING_SOFT || nv < VIT_RING_BITS {
-                    eprintln!("[atom] block={} 短い: soft={} vit={} (必要 {} / {})",
-                        self.rs_asm.rs_blocks_seen, ns, nv, VIT_RING_SOFT, VIT_RING_BITS);
-                } else {
-                    self.dump_atom =
-                        Some((atom_soft, atom_vit, self.rs_asm.dump_byte.clone()));
+                // このブロックの 204 バイトは `rs_byte_vitpos` の
+                // 直近 204 エントリに対応する。その**先頭**の vit 位置を
+                // lo とし、lo から 1632 ビットを取り出す。
+                //
+                // リングは生きたままなので lo は絶対位置。リング長を
+                // 引いた相対位置に変換してから切り出す。
+                let n_v = self.rs_byte_vitpos.len();
+                if n_v >= rs::N {
+                    let v_lo_abs = self.rs_byte_vitpos[n_v - rs::N];
+                    let ring = self.dump_vit.len() as u64;
+                    // リングは「現在位置まで」のみ保持。v_lo_abs が
+                    // リング外なら、そのブロックは保持範囲より古い。
+                    if v_lo_abs + (rs::N * 8) as u64 >= self.vit_bits_out {
+                        let cur = self.vit_bits_out;
+                        let start = v_lo_abs;
+                        let s_rel = (cur - start) as usize;   // リング先頭からの距離
+                        if s_rel < self.dump_vit.len() {
+                            let end = self.dump_vit.len();
+                            let atom_vit: Vec<u8> =
+                                self.dump_vit[s_rel..end].to_vec();
+                            // soft は vit 出力 1 ビット = 1 ステップ = 2 値。
+                            // 開始ステップ = (cur - ring) + s_rel ... だが
+                            //  Easier: soft の開始 = vit の位置 * 2 相当。
+                            let atom_soft: Vec<f32> = self.dump_soft_f32.clone();
+                            // 的瞬间の deinterleaver idx（絶対）。
+                            self.dump_deint_idx = self.bdeint.idx();
+                            self.dump_atom = Some((
+                                atom_soft,
+                                atom_vit,
+                                self.rs_asm.dump_byte.clone(),
+                            ));
+                        }
+                    }
                 }
+                let (ns, nv) = (self.dump_soft_f32.len(), self.dump_vit.len());
+                eprintln!(
+                    "[atom] block={} soft={}B vit={}b byte={}B atom={}",
+                    self.rs_asm.rs_blocks_seen, ns, nv, self.rs_asm.dump_byte.len(),
+                    self.dump_atom.is_some()
+                );
                 eprintln!(
                     "[atom] block={} soft={}B vit={}b byte={}B",
                     self.rs_asm.rs_blocks_seen, ns, nv, self.rs_asm.dump_byte.len()
@@ -3081,6 +3147,13 @@ impl StreamingDecoder {
             .as_ref()
             .map(|p| p.rs_asm.dump_byte_pre.clone())
             .unwrap_or_default()
+    }
+
+    /// 原子スナップショット時の `ByteDeinterleaver::idx`。
+    /// offline 再生で同じ出力列を得るには、この値まで idx を進めてから
+    /// push する（`push` が `idx % BI_I` で分岐を選ぶため）。
+    pub fn dump_deint_idx(&self) -> usize {
+        self.pipe.as_ref().map(|p| p.dump_deint_idx).unwrap_or(0)
     }
 
     /// **原子的に**取り出した 1 ブロック分 `(soft f32, vit bits, RS 入力 204B)`。

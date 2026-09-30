@@ -610,7 +610,11 @@ fn main() {
             std::fs::write(format!("{}.vit", base), vb).ok();
             let hx: String = by.iter().map(|b| format!("{:02X}", b)).collect();
             std::fs::write(format!("{}.byte", base), hx).ok();
-            eprintln!("[atomdump] soft={}B vit={}b byte={}B -> {}", sf.len(), vt.len(), by.len(), base);
+            // deinterleaver の idx。offline 再生で同じ出力列を得るために必要。
+            let di = dec.dump_deint_idx();
+            std::fs::write(format!("{}.didx", base), di.to_string()).ok();
+            eprintln!("[atomdump] soft={}B vit={}b byte={}B didx={} -> {}",
+                sf.len(), vt.len(), by.len(), di, base);
         }
     }
     if std::env::var("ISDBT_RSVPROBE").is_ok() {

@@ -429,6 +429,28 @@ impl ByteDeinterleaver {
         f.push_back(byte);
         f.pop_front().unwrap_or(byte) // 遅延0の分岐（k=I-1）はそのまま
     }
+
+    /// 現在の投入カウンタ（= 次に push されるバイトが乗る分岐を制御する）。
+    pub fn idx(&self) -> usize {
+        self.idx
+    }
+
+    /// offline 再生用: カウンタを絶対位置まで進めて、分岐の位相を
+    /// 稼働中の復調器と**同一に**する。
+    ///
+    /// `push()` は `self.idx % BI_I` で分岐を選ぶため、idx=0 から始めると
+    /// 稼働中とは別の分岐にバイトが乗り、出力バイト列が一致しない。
+    /// 遅延線の状態は「既に一定数埋まっている」ことが前提なので、
+    /// ここでも n 回ダミーを push してから本体を投入する。
+    pub fn prime_phase(&mut self, target_idx: usize) {
+        while self.idx < target_idx {
+            let k = self.idx % BI_I;
+            self.idx += 1;
+            let f = &mut self.fifos[k];
+            f.push_back(0u8);
+            f.pop_front();
+        }
+    }
 }
 
 /// Forney畳み込みバイト**インターリーバ**（送信側, I=12, M=17）。分岐kの遅延 `M*k`。

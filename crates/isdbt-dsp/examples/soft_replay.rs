@@ -96,6 +96,15 @@ fn main() {
 
     // --- 3. **保存済み vit** -> byte 整列 -> RS 入力バイトと一致するか ---
     let use_saved = std::env::var("USE_SAVED").is_ok();
+    // deinterleaver の位相。稼働中の復調器と同じにする。
+    // push() は `idx % BI_I` で分岐を選ぶため、idx=0 から始めると
+    // 別分支になり出力列が一致しない（先頭 1 バイトだけ 0x47 で
+    // 2 バイト目以降が全滅する — 実測）。
+    let didx: usize = a.get(3)
+        .and_then(|x| std::fs::read_to_string(x).ok())
+        .and_then(|x| x.trim().parse().ok())
+        .unwrap_or(0);
+    if didx > 0 { eprintln!("[replay] deinterleaver idx を {} に合わせる", didx); }
     let saved_bits: Vec<u8> = sv.iter().map(|c| if *c == b'1' {1u8} else {0u8}).collect();
     let mut bits: Vec<u8> = if use_saved { saved_bits.clone() } else { replayed.clone() };
     if use_saved { eprintln!("[replay] 保存済み vit を使用 ({} bit)", bits.len()); }
@@ -112,10 +121,41 @@ fn main() {
     let mut best: Option<(f32, usize, Vec<u8>)> = None;
     for c in 0..BI_I.min(bytes.len()) {
         let mut di = ByteDeinterleaver::new();
+        // 稼働中の復調器と**同一の分岐位相**に合わせる。
+        // `push()` は `idx % BI_I` で分岐を選ぶため、idx=0 から始めると
+        // 別の分岐にバイトが乗り出力列が一致しない（実測: 先頭 1 バイト
+        // だけ 0x47、2 バイト目以降が全滅）。
+        if didx > 0 {
+            di.prime_phase(didx);
+        }
         let mut stream: Vec<u8> = Vec::new();
         for (j, b) in bytes[c..].iter().enumerate() {
             let o = di.push(*b);
             if j >= BYTE_LATENCY { stream.push(o); }
+        }
+        // 出力の**全範囲**で RS 入力と一致する窓を探す。
+        // 原子スナップショットの vit は RS バイト0の出所から始まるので、
+        // deinterleaver の 2244 バイト分のラッシュを消費した
+        // 2244 付近に RS バイトが現れるはず。
+        let mut win: Option<(f64, usize, Vec<u8>)> = None;
+        // `stream` は既に BYTE_LATENCY 分を消費済みなので、
+        // 残る 204 バイトが否定できるかどうかだけを判定する。
+        if stream.len() >= rs::N {
+            for off in 0..=(stream.len() - rs::N) {
+                let mut same = 0usize;
+                for k in 0..rs::N {
+                    if stream[off + k] == bytes[k] { same += 1; }
+                }
+                let r = same as f64 / rs::N as f64;
+                if win.is_none() || r > win.as_ref().unwrap().0 {
+                    win = Some((r, off, stream[off..off + rs::N].to_vec()));
+                }
+            }
+            if let Some((r, off, w)) = &win {
+                println!("  全窓走査: 最良 offset={} 一致率 {:.2}%", off, r * 100.0);
+                let n = w.len().min(8);
+                println!("    窓の先頭8: {:02X?}", &w[..n]);
+            }
         }
         // 先頭から 204 バイト取り出して target と比較
         let n = rs::N.min(stream.len()).min(target.len());
