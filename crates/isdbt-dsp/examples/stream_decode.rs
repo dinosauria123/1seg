@@ -589,6 +589,21 @@ fn main() {
                 name, soft.len(), vit.len(), byte.len(), base);
         }
     }
+    // 診断: ロック判定の主張 vs 実運用の RS 符号語率。
+    if std::env::var("ISDBT_RSVPROBE").is_ok() {
+        let (v, n) = dec.dbg_rs_valid();
+        if let Some((cm, ro, bp, f)) = dec.dbg_lock_claim() {
+            eprintln!(
+                "[rsprobe] ロック判定: commutator={} reset_off={} block_phase={} 評価窓RS率={:.3}",
+                cm, ro, bp, f
+            );
+        }
+        eprintln!(
+            "[rsprobe] 実運用: RS符号語 {}/{} = {:.1}%",
+            v, n,
+            if n > 0 { v as f64 / n as f64 * 100.0 } else { 0.0 }
+        );
+    }
     // 診断: PRBS リセットが起きた block_idx の列。
     // 周期 64・offset 17 なら [17, 81, 145, ...] と等間隔になる。
     // 崩れていれば間隔が fleet ずれる = 位相ドリフトの原因。

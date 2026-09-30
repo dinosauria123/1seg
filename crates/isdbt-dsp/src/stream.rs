@@ -415,6 +415,12 @@ struct RsBlockAssembler {
     pub dump_target: u64,
     /// 段別ダンプを有効にするか。
     pub dump_span: u64,
+    /// 実運用の RS 符号語率を数えるか（`ISDBT_RSVPROBE=1`）。
+    pub rs_valid_probe: bool,
+    /// 実運用で RS 符号語（synd 全 0）だったブロック数。
+    pub rs_valid: u64,
+    /// 実運用でアセンブリされたブロック総数。
+    pub rs_seen: u64,
     pub dump_enabled: bool,
     /// 実際の RS 入力ブロック（descramble 後、204 バイト）。
     pub dump_byte_pre: Vec<u8>,
@@ -486,7 +492,7 @@ const BURST_THRESHOLD: usize = 32;
 
 impl RsBlockAssembler {
     fn new(phase: usize, reset_off: usize) -> Self {
-        Self { buffer: Vec::with_capacity(TSP), phase, reset_off, prbs: EnergyPrbs::with_init(PRBS_INIT), block_idx: 0, dump_target: u64::MAX, dump_span: 1, dump_enabled: false, dump_byte: Vec::new(), dump_byte_all: Vec::new(), dump_byte_pre: Vec::new(), prbs_reset_log: Vec::new(), drop_burst_hist: [0u64; 64], drop_burst_max: 0, rs_sync_ok: 0, rs_seen_decoded: 0, rs_corrected: 0, rs_bit_errors: 0, rs_symbol_errors: 0, rs_fail_reasons: [0; 4], rs_dropped: 0, rs_miscorrected: 0, rs_blocks_seen: 0, drop_burst: 0, burst_raised: false, drop_by_mod64: [0u32; 64], drop_by_mod256: [0u32; 256], drop_seen_blocks: 0 }
+        Self { buffer: Vec::with_capacity(TSP), phase, reset_off, prbs: EnergyPrbs::with_init(PRBS_INIT), block_idx: 0, rs_valid_probe: false, rs_valid: 0, rs_seen: 0, dump_target: u64::MAX, dump_span: 1, dump_enabled: false, dump_byte: Vec::new(), dump_byte_all: Vec::new(), dump_byte_pre: Vec::new(), prbs_reset_log: Vec::new(), drop_burst_hist: [0u64; 64], drop_burst_max: 0, rs_sync_ok: 0, rs_seen_decoded: 0, rs_corrected: 0, rs_bit_errors: 0, rs_symbol_errors: 0, rs_fail_reasons: [0; 4], rs_dropped: 0, rs_miscorrected: 0, rs_blocks_seen: 0, drop_burst: 0, burst_raised: false, drop_by_mod64: [0u32; 64], drop_by_mod256: [0u32; 256], drop_seen_blocks: 0 }
     }
 
     /// 復号できた RS ブロックを返す。訂正不能なブロックは**出力しない**
@@ -598,6 +604,17 @@ impl RsBlockAssembler {
                     // 選択済み soft / vit は Pipe 側で切り出す
                     // （ここではアセンブラなのでアクセスできない）。
                 }
+            }
+            // 診断: **実運用**での RS 符号語率を数える。
+            //
+            // ロック時の `RS復.decode率=0.934` は `demod_and_align` の
+            // 短い評価窓での値であり、これとは別物。実運用の streaming で
+            // どれだけのブロックが実際に RS 符号語になるかを数える。
+            if self.rs_valid_probe {
+                if rs::is_codeword(&ds) {
+                    self.rs_valid += 1;
+                }
+                self.rs_seen += 1;
             }
             let nz = rs::syndrome_weight(&ds);
             // 復号器が受け取ったブロックを数える。訂正不要（synd 全ゼロ）でも
@@ -2176,6 +2193,12 @@ impl Pipe {
 /// 逐次ストリーミング復調器。`feed` にIQのu8バイトを渡すと、生成されたTSバイトを返す。
 pub struct StreamingDecoder {
     demod: OfdmDemod,
+    /// ロック時に `demod_and_align` が採用した整列パラメータと評価値。
+    ///
+    /// `(commutator, reset_off, block_phase, 評価窓のRS復.decode率)`。
+    /// 診断時に「93%」と表示されても、これは**ロック判定の短い窓**での値であり、
+    /// 連続復調の実運用の性能とは一致しない（実測で 20 倍乖離した）。
+    lock_claim: Option<(usize, usize, usize, f32)>,
     buf: Vec<Complex32>,
     pending: Vec<u8>,
     dc: Complex32,
@@ -2264,6 +2287,7 @@ impl StreamingDecoder {
     pub fn new() -> Self {
         Self {
             demod: OfdmDemod::new(FFT_LEN),
+            lock_claim: None,
             buf: Vec::new(),
             pending: Vec::new(),
             dc: Complex32::new(0.0, 0.0),
@@ -2502,6 +2526,9 @@ impl StreamingDecoder {
             eprintln!("ロック失敗: navail={} specs={} phase0={}", navail, specs.len(), phase0);
             return; // ロック失敗（品質）。増データで再試行
         };
+        // 診断: ロック判定が採用したパラメータと評価値を保存する。
+        // 実運用の性能との乖離を調べるため。
+        self.lock_claim = Some((commutator, reset_off, block_phase, rs_rate));
         self.locked = Some(Locked {
             gi: est.guard,
             cfo: est.cfo_subcarriers,
@@ -2510,6 +2537,13 @@ impl StreamingDecoder {
             seg_off,
         });
         self.pipe = Some(Pipe::new(commutator, reset_off, block_phase, seg_off));
+        // 診断: 実運用の RS 符号語率を数える（`ISDBT_RSVPROBE=1`）。
+        // ロック判定の `RS復.decode率` との乖離を測るため。
+        if std::env::var("ISDBT_RSVPROBE").is_ok() {
+            if let Some(p) = self.pipe.as_mut() {
+                p.rs_asm.rs_valid_probe = true;
+            }
+        }
         // `ISDBT_DUMP=<blk>` で段別バイトダンプを有効にする（診断用）。
         if let Ok(v) = std::env::var("ISDBT_DUMP") {
             if let Ok(b) = v.parse::<u64>() {
@@ -2910,6 +2944,23 @@ impl StreamingDecoder {
     /// 診断: 全ブロックの `(ブロック番号, depu_pos % 4)`。
     /// 段別バイトダンプ `(soft量子化ビット, Viterbi出力ビット, byte整列後バイト)`。
     /// 連続する複数の RS 入力ブロック（descramble 後）。
+    /// 実運用で RS 符号語だったブロック数 / 総数。
+    pub fn dbg_rs_valid(&self) -> (u64, u64) {
+        self.pipe
+            .as_ref()
+            .map(|p| (p.rs_asm.rs_valid, p.rs_asm.rs_seen))
+            .unwrap_or((0, 0))
+    }
+
+    /// ロック時に `demod_and_align` が採用した整列パラメータと、
+    /// その**評価窓**で claimed された RS 復.decode 率。
+    ///
+    /// 実運用の性能とは別物。診断時に「93%」と出ていても、
+    /// 連続復調では 5% しか.decode できていない **/
+    pub fn dbg_lock_claim(&self) -> Option<(usize, usize, usize, f32)> {
+        self.lock_claim
+    }
+
     pub fn dump_blocks(&self) -> Vec<Vec<u8>> {
         self.pipe
             .as_ref()
