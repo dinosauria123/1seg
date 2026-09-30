@@ -94,8 +94,11 @@ fn main() {
     println!("末尾直接比較: {}/{} = {:.2}%", same, m,
         if m > 0 { same as f64 / m as f64 * 100.0 } else { 0.0 });
 
-    // --- 3. 再実行 vit -> byte 整列 -> RS 入力バイトと一致するか ---
-    let mut bits: Vec<u8> = replayed.clone();
+    // --- 3. **保存済み vit** -> byte 整列 -> RS 入力バイトと一致するか ---
+    let use_saved = std::env::var("USE_SAVED").is_ok();
+    let saved_bits: Vec<u8> = sv.iter().map(|c| if *c == b'1' {1u8} else {0u8}).collect();
+    let mut bits: Vec<u8> = if use_saved { saved_bits.clone() } else { replayed.clone() };
+    if use_saved { eprintln!("[replay] 保存済み vit を使用 ({} bit)", bits.len()); }
     while bits.len() % 8 != 0 { bits.pop(); }
     let mut bytes: Vec<u8> = Vec::new();
     for chunk in bits.chunks(8) {

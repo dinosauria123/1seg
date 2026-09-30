@@ -135,7 +135,25 @@ const RESET_BLK: usize = 0;
 const TMCC_SYMS_PER_FRAME: usize = 204;
 
 /// 段別ダンプのリング長。1 RS ブロック分に十分大きい。
-const DUMP_RING: usize = 8192; // 0 = 無効（Pipe::resync は Viterbi を壊す。上記コメント参照）
+const DUMP_RING: usize = 8192;
+
+/// 1 RS ブロック（204 バイト）に必要な soft 値の長さ。
+///
+/// 204 バイト = 1632 情報ビット、レート 2/3 なので 1728 トレリスステップ、
+/// 1 ステップ 2 値（X, Y）で **3456 値**。余裕をみて少し多めに取る。
+const RS_BLOCK_SOFT: usize = 3456;
+
+/// オフライン再現に必要な vit ビット数。
+///
+/// `ByteDeinterleaver` の遅延は `BI_M*BI_I*(BI_I-1) = 17*12*11 = 2244` バイト。
+/// 1 RS ブロック(204 バイト)ぶんを**出**すには、それより前に
+/// 2244 バイトぶんの vit (= 17952 ビット) が必要。
+/// さらに block_phase 分(最大 204 バイト)も足す。
+const VIT_RING_BITS: usize = 24_000;
+
+/// soft リングの保持長。vit の 3 倍（レート 2/3 + X/Y 対）を見込んで
+/// VIT_RING_BITS より大きめに取る。
+const VIT_RING_SOFT: usize = 60_000; // 0 = 無効（Pipe::resync は Viterbi を壊す。上記コメント参照）
 const PRBS_INIT: u16 = 0xa9;
 
 /// bin offset 探索半径。capture ごとに数 bin のズレが出るので TMCC 同期で決める。
@@ -584,8 +602,12 @@ impl RsBlockAssembler {
             // ブロック先頭で記録し、長さで切り出す（Viterbi depth と
             // byte 遅延を厳密に合わせるため）。
             if self.dump_enabled {
-                if self.rs_blocks_seen >= self.dump_target
-                    && self.rs_blocks_seen < self.dump_target + self.dump_span
+                // `rs_blocks_seen` はこの後で 1 増える（`+= 1` は下）。
+                // したがって対象ブロックの判定は「増加前 + 1 == target」。
+                let this_blk = self.rs_blocks_seen + 1;
+
+                if this_blk >= self.dump_target
+                    && this_blk < self.dump_target + self.dump_span
                 {
                     // 参考: `ds` は descramble 後のバイト列。実測すると
                     // syndrome が 16/16 非ゼロで RS 符号語になっていないため、
@@ -1105,6 +1127,20 @@ struct Pipe {
     /// 段別ダンプが有効か（`Pipe` 側フラグ、`rs_asm.dump_enabled` と対応）。
     pub dump_enabled: bool,
     pub dump_soft_f32: Vec<f32>,
+    /// **原子的な** 1 ブロック分の記録。
+    ///
+    /// 過去の計測は soft / vit / RS 入力を 3 つの独立したリングから
+    /// 取り出しており、切り出しタイミングが合わず「soft は健全なのに
+    /// RS は壊れている」という**結論自体が誤り**になっていた。
+    ///
+    /// ここでは byte ごとに (soft カーソル, vit カーソル) を記録し、
+    /// アセンブラが 204 バイトを完成させた時点で、その区間に対応する
+    /// soft / vit を**同じブロックから**切り出す。
+    pub dump_map: Vec<(usize, usize)>,
+    /// ブロック完了時にリング全体をスナップショットした soft。
+    pub dump_soft_snap: Vec<f32>,
+    /// 対象ブロックの記録（soft, vit, byte が同一ブロック由来）。
+    pub dump_atom: Option<(Vec<f32>, Vec<u8>, Vec<u8>)>,
     pub dump_soft: Vec<u8>,
     pub dump_vit: Vec<u8>,
     pub dump_byte: Vec<u8>,
@@ -1320,7 +1356,7 @@ impl Pipe {
             t_n: 0,
             dump_target: None,
             dump_enabled: false,
-            dump_soft_f32: Vec::new(), dump_soft: Vec::new(),
+            dump_soft_f32: Vec::new(), dump_map: Vec::new(), dump_soft_snap: Vec::new(), dump_atom: None, dump_soft: Vec::new(),
             dump_vit: Vec::new(),
             dump_byte: Vec::new(),
             dump_capture: false,
@@ -1991,7 +2027,12 @@ impl Pipe {
                     }
                     // 生の f32 値を保存する（量子化すると情報が失われ、
                     // オフライン再生で原因を判別できなくなる）。
-                    self.dump_soft_f32.push(kept);
+                    if self.dump_enabled {
+                        // ダンプ中は**循環させない**。drain すると保存済み
+                        // カーソル（絶対位置）と現在のベクトル（スライディング
+                        // ウィンドウ）がずれ、切り出しが空になる（実測）。
+                        self.dump_soft_f32.push(kept);
+                    }
                 }
                 // order=1
                 loop {
@@ -2039,8 +2080,9 @@ impl Pipe {
                 None => continue,
             };
             if self.dump_enabled {
-                if self.dump_vit.len() >= DUMP_RING {
-                    self.dump_vit.drain(0..DUMP_RING / 4);
+                if self.dump_vit.len() >= VIT_RING_BITS {
+                    let ov = self.dump_vit.len() - VIT_RING_BITS;
+                    self.dump_vit.drain(0..ov);
                 }
                 self.dump_vit.push(bit & 1);
             }
@@ -2068,6 +2110,25 @@ impl Pipe {
             }
             self.deint_out_idx += 1;
             self.dbg_bytes_to_rs += 1;
+            if self.dump_enabled {
+                // このバイトを消費した時点の soft / vit カーソル。
+                // 204 バイトが揃ったとき、この範囲が**そのブロックの**
+                // soft / vit になる。
+                // 固定長リング: 1 RS ブロック分の soft にちょうど
+                // なる長さだけ保持する。204 バイト = 1632 情報ビット =
+                // 1728 トレリスステップ = **3456 soft 値**。
+                // この長さのスライディングウィンドウなら、ブロック完了
+                // 時のリング全体が**そのブロックの soft** そのものになる。
+                // **各リングを独立に**トリムする。
+                // 共有 drain は soft（vit の約 3 倍の速度で増える）を
+                // vit と同じ量だけ削り、vit が毎回ほぼ空になっていた（実測:
+                // soft=24000 に対し vit=600）。これがオフライン再現不能の
+                // 直接原因だった。
+                if self.dump_soft_f32.len() > VIT_RING_SOFT {
+                    let over = self.dump_soft_f32.len() - VIT_RING_SOFT;
+                    self.dump_soft_f32.drain(0..over);
+                }
+            }
             // 診断: トレース有効時は RS へ入る直前のバイト列を蓄える。
             // 訂正不能ブロックは `rs_asm` から返らない（= 出力が消える）ので、
             // 手元で保持しておかないと「何が RS に入ったか」を後から検証できない。
@@ -2088,7 +2149,38 @@ impl Pipe {
                 self.dbg_depu_all
                     .push((self.rs_asm.rs_blocks_seen as usize, self.depu_pos % 4));
             }
+            let _seen_before = self.rs_asm.rs_blocks_seen;
             let (blocks, burst) = self.rs_asm.feed(&[o]);
+            // 原子的な 1 ブロック分の記録。
+            //
+            // `dump_map` は「バイトを 1 個消費した時点の soft/vit カーソル」の
+            // 配列。204 バイトが揃った = アセンブラがブロックを完成させた、
+            // 那一刻に、その 204 エントリで囲まれた範囲が**そのブロックの**
+            // soft / vit になる。3 つの記録を別々に切り出さずに済む。
+            // アセンブラ側でこのブロックの `dump_byte` が取られた直後。
+            if self.dump_enabled
+                && self.rs_asm.rs_blocks_seen == self.rs_asm.dump_target
+                && self.dump_soft_f32.len() >= VIT_RING_SOFT
+                && self.dump_vit.len() >= VIT_RING_BITS
+                && !self.rs_asm.dump_byte.is_empty()
+            {
+                // リング（RS_BLOCK_SOFT 個の soft 値）が**そのまま**
+                // このブロックの soft になる。
+                let atom_soft: Vec<f32> = self.dump_soft_f32.clone();
+                let atom_vit: Vec<u8> = self.dump_vit.clone();
+                let (ns, nv) = (atom_soft.len(), atom_vit.len());
+                if ns < VIT_RING_SOFT || nv < VIT_RING_BITS {
+                    eprintln!("[atom] block={} 短い: soft={} vit={} (必要 {} / {})",
+                        self.rs_asm.rs_blocks_seen, ns, nv, VIT_RING_SOFT, VIT_RING_BITS);
+                } else {
+                    self.dump_atom =
+                        Some((atom_soft, atom_vit, self.rs_asm.dump_byte.clone()));
+                }
+                eprintln!(
+                    "[atom] block={} soft={}B vit={}b byte={}B",
+                    self.rs_asm.rs_blocks_seen, ns, nv, self.rs_asm.dump_byte.len()
+                );
+            }
             // 診断: `rs_asm` は訂正不能のブロックを返さない（= TS から消える）。
             // 消えたブロックは手元に残した生バイト列でしか追えないので、
             // ここで「消えた」ことを記録し、トレース対象ならダンプする。
@@ -2542,6 +2634,18 @@ impl StreamingDecoder {
         self.pipe = Some(Pipe::new(commutator, reset_off, block_phase, seg_off));
         // 診断: 実運用の RS 符号語率を数える（`ISDBT_RSVPROBE=1`）。
         // ロック判定の `RS復.decode率` との乖離を測るため。
+        // 診断: 原子ダンプ（`ISDBT_ATOM=<blk>`）も dump を有効にする。
+        if let Ok(b) = std::env::var("ISDBT_ATOM") {
+            if let Ok(bb) = b.parse::<u64>() {
+                if let Some(p) = self.pipe.as_mut() {
+                    p.dump_target = Some(bb);
+                    p.dump_enabled = true;
+                    p.rs_asm.dump_target = bb;
+                    p.rs_asm.dump_enabled = true;
+                    eprintln!("[atom] 対象ブロック = {}", bb);
+                }
+            }
+        }
         if std::env::var("ISDBT_RSVPROBE").is_ok() {
             if let Some(p) = self.pipe.as_mut() {
                 p.rs_asm.rs_valid_probe = true;
@@ -2977,6 +3081,13 @@ impl StreamingDecoder {
             .as_ref()
             .map(|p| p.rs_asm.dump_byte_pre.clone())
             .unwrap_or_default()
+    }
+
+    /// **原子的に**取り出した 1 ブロック分 `(soft f32, vit bits, RS 入力 204B)`。
+    ///
+    /// 3 つの配列が**同一ブロック由来**であることを保証する。
+    pub fn dump_atom(&self) -> Option<(Vec<f32>, Vec<u8>, Vec<u8>)> {
+        self.pipe.as_ref().and_then(|p| p.dump_atom.clone())
     }
 
     /// 生の f32 soft 値（量子化前）。

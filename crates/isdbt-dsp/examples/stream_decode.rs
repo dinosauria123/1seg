@@ -597,6 +597,22 @@ fn main() {
         }
     }
     // 診断: ロック判定の主張 vs 実運用の RS 符号語率。
+    // 診断: **原子的な** 1 ブロック分の記録。
+    // soft / vit / RS 入力が同一ブロック由来であることが保証される。
+    if std::env::var("ISDBT_ATOM").is_ok() {
+        if let Some((sf, vt, by)) = dec.dump_atom() {
+            let name = std::env::var("ISDBT_ATOM").unwrap_or_default();
+            let base = format!("/tmp/atom_{}", if name.is_empty() { "0" } else { &name });
+            let mut o = String::new();
+            for v in &sf { o.push_str(&format!("{:.6} ", v)); }
+            std::fs::write(format!("{}.softf32", base), o).ok();
+            let vb: String = vt.iter().map(|b| if *b != 0 { '1' } else { '0' }).collect();
+            std::fs::write(format!("{}.vit", base), vb).ok();
+            let hx: String = by.iter().map(|b| format!("{:02X}", b)).collect();
+            std::fs::write(format!("{}.byte", base), hx).ok();
+            eprintln!("[atomdump] soft={}B vit={}b byte={}B -> {}", sf.len(), vt.len(), by.len(), base);
+        }
+    }
     if std::env::var("ISDBT_RSVPROBE").is_ok() {
         let (v, n) = dec.dbg_rs_valid();
         if let Some((cm, ro, bp, f)) = dec.dbg_lock_claim() {
