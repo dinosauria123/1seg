@@ -113,6 +113,11 @@ fn reset_blk() -> usize {
 /// `ISDBT_DEPUALL=1` で、全 RS ブロックの depuncture 位相を記録する。
 ///
 /// 既定は無効（64K 要素の `Vec` を持つため）。
+/// `ISDBT_PRSBALL=1` で PRBS リセット位置を全記録する。
+fn dbg_prbs_all_enabled() -> bool {
+    std::env::var("ISDBT_PRSBALL").map(|v| v != "0").unwrap_or(false)
+}
+
 fn dbg_depu_all_enabled() -> bool {
     std::env::var("ISDBT_DEPUALL").map(|v| v != "0").unwrap_or(false)
 }
@@ -401,14 +406,19 @@ struct RsBlockAssembler {
     /// これが崩れていれば「soft は正しいのに RS が壊れる」原因が
     /// 整列のズレであり、Viterbi 自体には無実。
     /// 連続訂正不能長の分布（添字 = 連続長-1、値 = 発生回数）。
+    /// PRBS リセットが起きた block_idx の列（`ISDBT_PRSBALL=1`）。
+    prbs_reset_log: Vec<usize>,
     pub drop_burst_hist: [u64; 64],
     /// 最長バースト。
     pub drop_burst_max: u64,
     /// 段別ダンプの対象ブロック番号（`rs_blocks_seen` 基準）。
     pub dump_target: u64,
     /// 段別ダンプを有効にするか。
+    pub dump_span: u64,
     pub dump_enabled: bool,
     /// 実際の RS 入力ブロック（descramble 後、204 バイト）。
+    pub dump_byte_pre: Vec<u8>,
+    pub dump_byte_all: Vec<Vec<u8>>,
     pub dump_byte: Vec<u8>,
     pub rs_sync_ok: u64,
     pub rs_seen_decoded: u64,
@@ -476,7 +486,7 @@ const BURST_THRESHOLD: usize = 32;
 
 impl RsBlockAssembler {
     fn new(phase: usize, reset_off: usize) -> Self {
-        Self { buffer: Vec::with_capacity(TSP), phase, reset_off, prbs: EnergyPrbs::with_init(PRBS_INIT), block_idx: 0, dump_target: u64::MAX, dump_enabled: false, dump_byte: Vec::new(), drop_burst_hist: [0u64; 64], drop_burst_max: 0, rs_sync_ok: 0, rs_seen_decoded: 0, rs_corrected: 0, rs_bit_errors: 0, rs_symbol_errors: 0, rs_fail_reasons: [0; 4], rs_dropped: 0, rs_miscorrected: 0, rs_blocks_seen: 0, drop_burst: 0, burst_raised: false, drop_by_mod64: [0u32; 64], drop_by_mod256: [0u32; 256], drop_seen_blocks: 0 }
+        Self { buffer: Vec::with_capacity(TSP), phase, reset_off, prbs: EnergyPrbs::with_init(PRBS_INIT), block_idx: 0, dump_target: u64::MAX, dump_span: 1, dump_enabled: false, dump_byte: Vec::new(), dump_byte_all: Vec::new(), dump_byte_pre: Vec::new(), prbs_reset_log: Vec::new(), drop_burst_hist: [0u64; 64], drop_burst_max: 0, rs_sync_ok: 0, rs_seen_decoded: 0, rs_corrected: 0, rs_bit_errors: 0, rs_symbol_errors: 0, rs_fail_reasons: [0; 4], rs_dropped: 0, rs_miscorrected: 0, rs_blocks_seen: 0, drop_burst: 0, burst_raised: false, drop_by_mod64: [0u32; 64], drop_by_mod256: [0u32; 256], drop_seen_blocks: 0 }
     }
 
     /// 復号できた RS ブロックを返す。訂正不能なブロックは**出力しない**
@@ -519,6 +529,13 @@ impl RsBlockAssembler {
             };
             if self.block_idx % reset_period() == ro {
                 self.prbs.reset_to(PRBS_INIT);
+                // 診断: PRBS リセットが実際にどの block_idx で起きているか。
+                //
+                // 前提は「block_idx が 1 ブロックにつき 1 だけ増える」こと。
+                // これが崩れると reset_off=17 は正しくても実際の位相がずれる。
+                if dbg_prbs_all_enabled() {
+                    self.prbs_reset_log.push(self.block_idx);
+                }
             }
             let start = self.phase;
             let mut ds = Vec::with_capacity(TSP);
@@ -561,7 +578,21 @@ impl RsBlockAssembler {
             // ブロック先頭で記録し、長さで切り出す（Viterbi depth と
             // byte 遅延を厳密に合わせるため）。
             if self.dump_enabled {
-                if self.rs_blocks_seen == self.dump_target {
+                if self.rs_blocks_seen >= self.dump_target
+                    && self.rs_blocks_seen < self.dump_target + self.dump_span
+                {
+                    // 参考: `ds` は descramble 後のバイト列。実測すると
+                    // syndrome が 16/16 非ゼロで RS 符号語になっていないため、
+                    // descramble **前**の生バイトも並べて確認する。
+                    self.dump_byte_pre = self.buffer[start..start + TSP].to_vec();
+                    if self.dump_byte_all.len() < 64 * 204 {
+                        eprintln!(
+                            "[dumptrace] rs_blocks_seen={} phase={} block_idx={} buf_len={} start={}",
+                            self.rs_blocks_seen, self.phase, self.block_idx,
+                            self.buffer.len(), start
+                        );
+                        self.dump_byte_all.push(ds.clone());
+                    }
                     self.dump_byte = ds.clone();
                     eprintln!("[dump] assembler hit block {}", self.rs_blocks_seen);
                     // 選択済み soft / vit は Pipe 側で切り出す
@@ -2486,6 +2517,10 @@ impl StreamingDecoder {
                     p.dump_target = Some(b);
                     p.rs_asm.dump_target = b;
                     p.rs_asm.dump_enabled = true;
+                    p.rs_asm.dump_span = std::env::var("ISDBT_DUMPSPAN")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(1);
                     p.dump_enabled = true;
                     eprintln!("[dump] 対象ブロック = {} (rs_blocks_seen 基準)", b);
                 }
@@ -2874,11 +2909,35 @@ impl StreamingDecoder {
     pub fn dbg_buf_len(&self) -> u64 { self.buf.len() as u64 }
     /// 診断: 全ブロックの `(ブロック番号, depu_pos % 4)`。
     /// 段別バイトダンプ `(soft量子化ビット, Viterbi出力ビット, byte整列後バイト)`。
+    /// 連続する複数の RS 入力ブロック（descramble 後）。
+    pub fn dump_blocks(&self) -> Vec<Vec<u8>> {
+        self.pipe
+            .as_ref()
+            .map(|p| p.rs_asm.dump_byte_all.clone())
+            .unwrap_or_default()
+    }
+
+    /// descramble 前（`buffer` 由来）の生バイト。
+    pub fn dump_pre(&self) -> Vec<u8> {
+        self.pipe
+            .as_ref()
+            .map(|p| p.rs_asm.dump_byte_pre.clone())
+            .unwrap_or_default()
+    }
+
     pub fn dump_stages(&self) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         self.pipe
             .as_ref()
             .map(|p| (p.dump_soft.clone(), p.dump_vit.clone(), p.rs_asm.dump_byte.clone()))
             .unwrap_or((vec![], vec![], vec![]))
+    }
+
+    /// PRBS リセットが起きた block_idx の列。
+    pub fn dbg_prbs_resets(&self) -> Vec<usize> {
+        self.pipe
+            .as_ref()
+            .map(|p| p.rs_asm.prbs_reset_log.clone())
+            .unwrap_or_default()
     }
 
     /// TMCC フレーム境界の RS ブロック位置。

@@ -567,9 +567,39 @@ fn main() {
             std::fs::write(format!("{}.soft.txt", base), &s2).ok();
             std::fs::write(format!("{}.vit.txt", base), &v2).ok();
             std::fs::write(format!("{}.byte.hex", base), hex(&byte)).ok();
+            let blocks = dec.dump_blocks();
+            if blocks.len() > 1 {
+                for (i, b) in blocks.iter().enumerate() {
+                    let hx: String = b.iter().map(|x| format!("{:02X}", x)).collect();
+                    std::fs::write(format!("{}.blk{:02}.hex", base, i), hx).ok();
+                }
+                let mut o = String::new();
+                for (i, b) in blocks.iter().enumerate() {
+                    let hd = b.iter().take(8).map(|x| format!("{:02X}", x)).collect::<Vec<_>>().join("");
+                    o.push_str(&format!("{}:{} ", i, hd));
+                }
+                eprintln!("[dumpblocks] {} blocks", blocks.len());
+                eprintln!("[dumpblocks] {}", o);
+            }
+            let pre = dec.dump_pre();
+            if !pre.is_empty() {
+                std::fs::write(format!("{}.pre.hex", base), hex(&pre)).ok();
+            }
             eprintln!("[dump] blk={} soft={}B vit={}b byte={}B -> {}",
                 name, soft.len(), vit.len(), byte.len(), base);
         }
+    }
+    // 診断: PRBS リセットが起きた block_idx の列。
+    // 周期 64・offset 17 なら [17, 81, 145, ...] と等間隔になる。
+    // 崩れていれば間隔が fleet ずれる = 位相ドリフトの原因。
+    if std::env::var("ISDBT_PRSBALL").is_ok() {
+        let v = dec.dbg_prbs_resets();
+        let mut gaps = String::new();
+        for w in v.windows(2) {
+            gaps.push_str(&format!("{} ", w[1] - w[0]));
+        }
+        eprintln!("[prbsall] resets={} 先頭={:?}", v.len(), v.first());
+        eprintln!("[prbsall] 間隔 = {}", gaps);
     }
     if std::env::var("ISDBT_TMCCFRM").is_ok() {
         let h = dec.dbg_tmcc_frame_pos();
