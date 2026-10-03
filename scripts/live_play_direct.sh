@@ -42,8 +42,27 @@ LOG=/tmp/isdbt_live.log
 PLOG=/tmp/isdbt_ffplay.log
 ALIVE=/tmp/isdbt_writer.alive
 
+# ロック監視を起動する。ロック到達まで 1 分以上かかるため、
+# このスクリプトは起動した側にロック到達を待たせない。
+# lock_watch.py は /tmp/isdbt_live.log を逐次読みして到達を
+# /tmp/isdbt_lock.log に時刻付きで記録し続ける。
+#   監視開始: tail -f /tmp/isdbt_lock.log
+#   監視停止: pkill -f lock_watch.py
+#
+# 注意: **stop_live.sh より後ろで起動すること。** stop_live.sh は
+# lock_watch.py も（PID ファイル経由で）kill するので、先に起動すると
+# 即座に殺される。
 bash "$HOME/oneseg-rs/scripts/stop_live.sh" >/dev/null 2>&1
 sleep 1
+
+PIDF=/tmp/isdbt_launcher.pid
+: > /tmp/isdbt_lock.log
+nohup python3 "$HOME/oneseg-rs/scripts/lock_watch.py" >/dev/null 2>&1 &
+WATCH_PID=$!
+# stop_live.sh が PID ファイルで落とせるように記録する（`pgrep -f` は
+# 呼び出し元シェルにマッチして自爆するため使わない）。
+echo "$WATCH_PID" > "$PIDF"
+echo "lock_watch=$WATCH_PID  →  tail -f /tmp/isdbt_lock.log"
 
 rm -f "$IQFIFO" "$IQFILE" "$TSFIFO" "$ALIVE"
 mkfifo "$IQFIFO"; mkfifo "$TSFIFO"
@@ -72,6 +91,7 @@ nohup ffplay -fflags nobuffer -flags low_delay -framedrop \
   -f mpegts -i "$TSFIFO" > "$PLOG" 2>&1 &
 FFPLAY_PID=$!
 
-echo "ffplay=$FFPLAY_PID  dec=$DEC_PID"
+echo "ffplay=$FFPLAY_PID  dec=$DEC_PID  lock_watch=$WATCH_PID"
+echo "ロック監視: tail -f /tmp/isdbt_lock.log   ← 1〜2 分待つとロック到達が出る"
 echo "ログ: $LOG / $PLOG"
-echo "停止: $HOME/oneseg-rs/scripts/stop_live.sh"
+echo "停止: $HOME/oneseg-rs/scripts/stop_live.sh  （lock_watch も一緒に止まる）"
