@@ -64,13 +64,31 @@ WATCH_PID=$!
 echo "$WATCH_PID" > "$PIDF"
 echo "lock_watch=$WATCH_PID  →  tail -f /tmp/isdbt_lock.log"
 
-rm -f "$IQFIFO" "$IQFILE" "$TSFIFO" "$ALIVE"
+rm -f "$IQFIFO" "$TSFIFO" "$ALIVE"
 mkfifo "$IQFIFO"; mkfifo "$TSFIFO"
 : > "$LOG"; : > "$PLOG"
 
+# IQ ファイルは**消さない**。前回受信した IQ を先頭に読んで追従下去るので、
+# 既に 160 MB たまっていれば数秒でロックできる。
+#
+# 消していたのは **78 秒待つのに直結していた**（実測 2026-10-04 01:12）。
+# 復調は 2 MB/s で溜め直す必要があり、ロックまでに 78 秒 = 約 160 MB。
+# TS ファイルは問題ないので、古い IQ を溜め込んでも害はない。
+# 保持量は IQ_KEEP で制限する（既定 400 MB）。
+IQ_KEEP="${IQ_KEEP:-400000000}"
+if [ -f "$IQFILE" ]; then
+  sz=$(stat -c%s "$IQFILE" 2>/dev/null || echo 0)
+  if [ "$sz" -gt "$IQ_KEEP" ]; then
+    # 末尾 $IQ_KEEP バイトだけ残す（先頭を捨ててから完全に作り直す）
+    tail -c "$IQ_KEEP" "$IQFILE" > "$IQFILE.new" && mv "$IQFILE.new" "$IQFILE"
+    echo "IQ ファイルを $IQ_KEEP バイトに切り詰め"
+  fi
+fi
+
 # 1) rtl_sdr → IQFIFO → IQFILE（append）。stream_decode は --follow で
 #    IQFILE を追従して読むので、生 IQ はここで溜め込む。
-( exec 3>"$IQFILE"; cat "$IQFIFO" >&3 ) >/dev/null 2>&1 &
+#    append (`>>`) で開く。`: > "$IQFILE"` で truncate しないこと。
+( exec 3>>"$IQFILE"; cat "$IQFIFO" >&3 ) >/dev/null 2>&1 &
 sleep 1
 
 # 2) rtl_sdr を起動
@@ -79,7 +97,24 @@ sleep 2
 echo -n 1 > "$ALIVE"
 
 # 3) stream_decode --follow で IQFILE を追従読取 → TSFIFO
-ISDBT_WRITER="$ALIVE" nohup \
+#
+# **ISDBT_SEGOFF で bin offset を固定する（実測 2026-10-04 01:26）。**
+#
+# bin offset の自動探索（`rank_segment_offsets` → RS 復号率で絞り込み）は
+# IQ ファイル全体を走査するため、保持量を増やすと比例して時間がかかる。
+# 実測: 400 MB（200 秒分）で**ロック到達まで 63 秒**。IQ を消していた
+# 頃は 78 秒。IQ を多く保持しても探索時間は減らない。
+#
+# 一方 bin offset は受信周波数だけで決まり、同じ周波数なら毎回同じ値。
+# 実測で 485.142857 MHz は 307 か 308（1 bin = 992 Hz の量子化）を安定して
+# 返す（RS 復号率 0.93〜0.98 で稼働中）。
+#
+# 現在の受信周波数での実測値を保存し、次回以降は再探索しない。
+SEGOFF_FILE=/tmp/isdbt_segoff
+[ -f "$SEGOFF_FILE" ] || echo "308" > "$SEGOFF_FILE"
+SEGOFF="$(cat "$SEGOFF_FILE")"
+echo "bin offset を固定: ISDBT_SEGOFF=$SEGOFF  （$SEGOFF_FILE で変更可）"
+ISDBT_WRITER="$ALIVE" ISDBT_SEGOFF="$SEGOFF" nohup \
   stdbuf -oL ./target/release/examples/stream_decode "$IQFILE" "$TSFIFO" --live --follow \
   >>"$LOG" 2>&1 &
 DEC_PID=$!

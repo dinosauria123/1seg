@@ -2645,37 +2645,53 @@ impl StreamingDecoder {
             return;
         }
         let specs = probe;
+        // bin offset の決め方:
+        //
         // TMCC 一致度だけで決めない。TMCC は 1 フレーム 204 シンボルのうち
         // 1 シンボル分しかないので、bin offset が 1 ずれても同期一致 100% に
         // なる（実測: disc_test.iq は offset 307 で同期 1.000 だが訂正不能 31.9%、
         // p1.iq は offset 308 で訂正不能 0.1%）。そこで TMCC スコアの順に
         // 上位を数個候補にして、**実 RS 復号率**で決め直す。
-        let cands = crate::tmcc::rank_segment_offsets(&specs, OFFSET_RADIUS, RS_REFINE_TOP_N);
-        let Some((mut seg_off, rs_rate, all)) = select_segment_offset_by_rs(&specs, &cands) else {
-            eprintln!("offset 候補 ({cands:?}) すべてで RS 復号 0%: ロック失敗（品質不良）");
-            return;
-        };
-        if seg_off != cands[0] {
-            eprintln!(
-                "bin offset TMCC 優先={} だが RS 復号率で {} を採用",
-                cands[0], seg_off
-            );
-        }
-        // 診断: `ISDBT_SEGOFF` で bin offset を強制固定する。
         //
-        // 連続 capture は 307、後半単独 capture は 308 を自動選択した。
-        // 1 bin = 992 Hz なので、**`l=207` を比べたのは 992 Hz ずれた
-        // 周波数の profile だった可能性がある**。両者を同じ bin に固定して
-        // 初めて「同じ `l` = 同じ物理キャリア」を主張できる。
-        if let Ok(v) = std::env::var("ISDBT_SEGOFF") {
-            if let Ok(f) = v.parse::<usize>() {
-                eprintln!("ISDBT_SEGOFF={f} で bin offset を固定（自動選択の {seg_off} を無視）");
-                seg_off = f;
+        // ただし `ISDBT_SEGOFF` で固定指定されているなら、この 33 候補の
+        // RS 評価（それぞれ 204 バイトぶんの復号 subsection）は**丸ごと不要**。
+        // 実測 2026-10-04: この評価だけで 60 秒以上かかっていた。
+        let forced = std::env::var("ISDBT_SEGOFF")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+        let (mut seg_off, rs_rate, all) = if let Some(f) = forced {
+            eprintln!("ISDBT_SEGOFF={f} で bin offset を固定（RS 候補評価を省略）");
+            // 固定指定なので RS 復号率はまだ未知。0.0 を入れて「未評価」とする。
+            // ロックの可否は TMCC 同期一致率と実際の復号で判断される。
+            (f, 0.0_f32, Vec::new())
+        } else {
+            let cands =
+                crate::tmcc::rank_segment_offsets(&specs, OFFSET_RADIUS, RS_REFINE_TOP_N);
+            let Some((seg_off, rs_rate, all)) = select_segment_offset_by_rs(&specs, &cands)
+            else {
+                eprintln!("offset 候補 ({cands:?}) すべてで RS 復号 0%: ロック失敗（品質不良）");
+                return;
+            };
+            if seg_off != cands[0] {
+                eprintln!(
+                    "bin offset TMCC 優先={} だが RS 復号率で {} を採用",
+                    cands[0], seg_off
+                );
             }
-        }
+            (seg_off, rs_rate, all)
+        };
         let scores: Vec<String> = all.iter().map(|(o, f)| format!("{o}:{f:.3}")).collect();
+        // `rs_rate` は `ISDBT_SEGOFF` で固定したときは**未評価**（0.0 が
+        // 代入されている）。0.000 と出すと「RS 復号率ゼロ = 受信不可能」と
+        // 誤読されるので、理由を明示する（実測 2026-10-04: ログだけ見ると
+        // ロック失敗に見える）。
+        let rs_txt = if forced.is_some() {
+            format!("未評価（固定 offset {seg_off}）")
+        } else {
+            format!("{rs_rate:.3}")
+        };
         eprintln!(
-            "bin offset={seg_off} (nominal {}) TMCC同期={sync:.3} known={known:.3} RS復号率={rs_rate:.3} 候補=[{}]",
+            "bin offset={seg_off} (nominal {}) TMCC同期={sync:.3} known={known:.3} RS復号率={rs_txt} 候補=[{}]",
             crate::equalize::SEGMENT_BIN_OFFSET,
             scores.join(" "),
         );
