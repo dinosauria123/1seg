@@ -114,23 +114,54 @@ echo -n 1 > "$ALIVE"
 
 # 3) stream_decode --follow で IQFILE を追従読取 → TSFIFO
 #
-# **ISDBT_SEGOFF で bin offset を固定する（実測 2026-10-04 01:26）。**
+# **bin offset はチャンネルごとに違う**（実測 2026-10-04 03:0x）。
 #
 # bin offset の自動探索（`rank_segment_offsets` → RS 復号率で絞り込み）は
 # IQ ファイル全体を走査するため、保持量を増やすと比例して時間がかかる。
 # 実測: 400 MB（200 秒分）で**ロック到達まで 63 秒**。IQ を消していた
 # 頃は 78 秒。IQ を多く保持しても探索時間は減らない。
 #
-# 一方 bin offset は受信周波数だけで決まり、同じ周波数なら毎回同じ値。
-# 実測で 485.142857 MHz は 307 か 308（1 bin = 992 Hz の量子化）を安定して
-# 返す（RS 復号率 0.93〜0.98 で稼働中）。
+# 1 bin = 992 Hz の量子化なので、bin offset は**チャンネルごとに違う**。
 #
-# 現在の受信周波数での実測値を保存し、次回以降は再探索しない。
-SEGOFF_FILE=/tmp/isdbt_segoff
-[ -f "$SEGOFF_FILE" ] || echo "308" > "$SEGOFF_FILE"
+# **測定値は参考。±RETRY で自己修復する**
+#
+# 自動探索は IQ ファイル全体を走査するので、IQ 量を増やしても 63 秒
+# かかる。固定して回避する。
+#
+# **しかし固定値の測定は不正確**（実測 2026-10-04）:
+#   STV の 4 通りの capture 比較（同一 IQ 320 MB、`ISDBT_SEGOFF_RETRY=0`）
+#       offset=307  TS=0 B          失敗
+#       offset=308  TS=1,572,244 B  **これが正解**
+#       offset=309  TS=0 B          失敗
+#       offset=310  TS=0 B          失敗
+#   一方 survey（20 MB 測定）は 309 と報告していた。つまり survey の値は
+#   **偽値**。bin offset の正解は 1 bin の精度で決まるので、20 MB の測定
+#   だけでは wrong bin を掴む。
+#
+# したがって survey の値をそのまま固定するのは危険。**±RETRY で自己修復
+# させる**のが正しい（ユーザーの助言: 「ロックしなければ別の数値で試す」）。
+# `ISDBT_SEGOFF_RETRY` の分だけ周回するので、survey の値が 1 bin ずれて
+# いても 最終的に正解に当たる。
+#
+# 実測値（`scripts/diag/seg_offset_survey.py`、2026-10-04 03:1x、参考値）:
+#   ch13 NHK教育 307      ch14 TVh     308      ch15 NHK総合 308
+#   ch19 HBC     308      ch21 STV     309      ch23 HTB     309
+#   ch25 UHB     309
+#
+# 周波数ごとの値を survey が `/tmp/isdbt_segoff_<freq>` に保存する。
+# 値が無いチャンネルは 308 を仮定する（リトライが正解に当たるので、
+# 63 秒の自動探索より速い）。
+SEGOFF_RETRY="${SEGOFF_RETRY:-2}"
+SEGOFF_FILE="/tmp/isdbt_segoff_${FREQ}"
+if [ ! -f "$SEGOFF_FILE" ]; then
+  echo "警告: $SEGOFF_FILE が無い（bin offset を 308 と仮定）。"
+  echo "      測り直すには: python3 scripts/diag/seg_offset_survey.py"
+  echo "308" > "$SEGOFF_FILE"
+fi
 SEGOFF="$(cat "$SEGOFF_FILE")"
-echo "bin offset を固定: ISDBT_SEGOFF=$SEGOFF  （$SEGOFF_FILE で変更可）"
-ISDBT_WRITER="$ALIVE" ISDBT_SEGOFF="$SEGOFF" nohup \
+echo "bin offset: ISDBT_SEGOFF=$SEGOFF ±$SEGOFF_RETRY  ($SEGOFF_FILE)"
+ISDBT_WRITER="$ALIVE" ISDBT_SEGOFF="$SEGOFF" ISDBT_SEGOFF_RETRY="$SEGOFF_RETRY" \
+  nohup \
   stdbuf -oL ./target/release/examples/stream_decode "$IQFILE" "$TSFIFO" --live --follow \
   >>"$LOG" 2>&1 &
 DEC_PID=$!

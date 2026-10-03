@@ -292,11 +292,27 @@ class App:
 
     def play(self):
         _ch, freq, _p, _s, _r = CHANNELS[self.index]
-        # bin offset を固定する（commit 236ab6f）。実測で全 ch とも 308。
-        with open(SEGOFF_FILE, "w") as fh:
-            fh.write("308\n")
+        # bin offset はチャンネルごとに違う（1 bin = 992 Hz の量子化で受信機の
+        # LO 周波数誤差による）。しかも **survey の測定値は不正確** ——
+        # STV の正解は 308 なのに survey（20 MB）は 309 と報告した
+        # （320 MB で 307/308/309/310 を比較すると 308 だけが TS を出した、
+        #   他は 0 B。実測 2026-10-04）。
+        #
+        # そのため survey の値を固定するのではなく、**±リトライで自己修復
+        # させる**。`live_play_direct.sh` が `ISDBT_SEGOFF_RETRY` を渡す
+        # ので、値が 1 bin ずれていても 最終的に正解に当たる。
+        # ここでは survey の値を初期候補として渡すだけ。
+        segoff_path = f"/tmp/isdbt_segoff_{freq}"
+        try:
+            with open(segoff_path) as fh:
+                segoff = fh.read().strip()
+        except OSError:
+            segoff = "308"
+            with open(segoff_path, "w") as fh:
+                fh.write(segoff + "\n")
+
         self.lbl_state.config(text="… 起動中", fg=WARN)
-        self.lbl_log.config(text="停止してから切り替えます…", fg=WARN)
+        self.lbl_log.config(text=f"bin offset {segoff} で起動します…", fg=WARN)
         self.root.update_idletasks()
 
         # **ffplay を明示的に kill してから起動する。**

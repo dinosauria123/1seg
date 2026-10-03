@@ -179,6 +179,21 @@ const BYTE_LATENCY: usize = BI_M * BI_I * (BI_I - 1);
 const LOCK_SYMS: usize = 4000;
 const COMPACT_AT: usize = 8 * 1024 * 1024;
 
+/// `ISDBT_SEGOFF` で固定した bin offset の周囲を試す範囲。
+///
+/// bin offset は測定ごとに 1 bin ぶれる（実測 2026-10-04: ch14 TVh が
+/// 8 MB 測定で 308、20 MB 測定で 307）。1 bin = 992 Hz なので、これは
+/// 受信機の LO 周波数誤差か SNR による選択の揺動。
+///
+/// 固定値が 1 bin ずれていれば `demod_and_align` が None を返し
+/// TS 0 バイトになる（実測: STV に 308 を渡して
+/// `ロック失敗: navail=4000 specs=4000 phase0=3`）。
+///
+/// そこで「ロックしなければ別の数値で試す」を実装する。指定値の周围を
+/// `0, -1, +1, -2, +2` の順に試す（0 は最優先。探索コスト=none）。
+/// `ISDBT_SEGOFF_RETRY=<n>` で範囲を変えられる（既定 2、0 で無効化）。
+const SEGOFF_RETRY_DEFAULT: usize = 2;
+
 /// `buf` を切り詰める境界長（サンプル）。`ISDBT_COMPACT` で上書き可。
 ///
 /// **実測 2026-09-26 の主因候補**: `drain(0..drop)` はサンプル単位の丸め
@@ -2695,14 +2710,68 @@ impl StreamingDecoder {
             crate::equalize::SEGMENT_BIN_OFFSET,
             scores.join(" "),
         );
-        let (phase0, _) = detect_symbol_phase(
-            &extract_segment(&specs[0], seg_off),
-            &SegmentPilots::center_1seg(),
-        );
-        let Some((commutator, reset_off, block_phase)) = lock_params(&specs, phase0, seg_off) else {
-            eprintln!("ロック失敗: navail={} specs={} phase0={}", navail, specs.len(), phase0);
+        // `ISDBT_SEGOFF` で固定したときは周围も試す（ロックしなければ別の数値で）。
+        // bin offset は 1 bin ぶれうるので、指定値だけ試して諦めると
+        // 1 bin のずれで TS 0 バイトになる（実測: STV に 308 を渡した場合）。
+        let mut params = None;
+        let mut used_off = seg_off;
+        let mut phase0 = {
+            let (p, _) = detect_symbol_phase(
+                &extract_segment(&specs[0], seg_off),
+                &SegmentPilots::center_1seg(),
+            );
+            p
+        };
+        if forced.is_some() {
+            let retry = std::env::var("ISDBT_SEGOFF_RETRY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(SEGOFF_RETRY_DEFAULT);
+            // 0, -1, +1, -2, +2 の順。近い方を先に。
+            let mut deltas: Vec<isize> = vec![0];
+            for d in 1..=retry {
+                deltas.push(-(d as isize));
+                deltas.push(d as isize);
+            }
+            for d in deltas {
+                let Some(cand) = seg_off.checked_add_signed(d) else {
+                    continue;
+                };
+                if cand == 0 {
+                    continue;
+                }
+                let (p0, _) = detect_symbol_phase(
+                    &extract_segment(&specs[0], cand),
+                    &SegmentPilots::center_1seg(),
+                );
+                if let Some(p) = lock_params(&specs, p0, cand) {
+                    if d != 0 {
+                        eprintln!(
+                            "bin offset {} ではロックできず、周囲 {} でロック（Δ{}）",
+                            seg_off, cand, d
+                        );
+                    }
+                    params = Some(p);
+                    used_off = cand;
+                    phase0 = p0;
+                    break;
+                }
+            }
+        } else {
+            params = lock_params(&specs, phase0, seg_off);
+        }
+        let Some((commutator, reset_off, block_phase)) = params else {
+            eprintln!(
+                "ロック失敗: navail={} specs={} seg_off={} (±{} 試行しても)",
+                navail, specs.len(), seg_off,
+                std::env::var("ISDBT_SEGOFF_RETRY")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(SEGOFF_RETRY_DEFAULT),
+            );
             return; // ロック失敗（品質）。増データで再試行
         };
+        seg_off = used_off;
         // 診断: ロック判定が採用したパラメータと評価値を保存する。
         // 実運用の性能との乖離を調べるため。
         self.lock_claim = Some((commutator, reset_off, block_phase, rs_rate));
