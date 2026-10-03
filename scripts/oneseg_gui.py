@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""1seg 受信機の tkinter GUI（札幌・手稲山親局）。
+
+操作:
+  - ▲ CH / ▼ CH ボタン、または ↑ ↓ キー      … チャンネル切替
+  - ▶ 再生 / ■ 停止 ボタン、または Space / Esc
+  - 映像は ffplay のウィンドウで表示する（GUI には内蔵しない）
+
+チャンネル一覧について
+----------------------
+札幌（手稲山）親局の割当。出典:
+  - NHK北海道 受信情報 札幌放送局チャンネル一覧
+    https://www.nhk.or.jp/hokkaido/station_info/ch_sapporo.html
+  - 北海道圏テレビジョンチャンネル表（2024/01/18 更新）
+    http://hokkaido.basekernel.ne.jp/pc/hokkaido-tv-list.html
+
+    局名    NHK総合 NHK教育 HBC   STV   UHB   HTB   TVh
+    札幌     15ch   13ch     19ch  21ch  25ch  23ch  14ch
+
+**_freq_hz は自前の実測値**（ch 13〜52 を 1 MHz 間隔で走査し、平均電力
+が 20 を超えたチャンネル）。実測電力: ch13=1.6  ch14=75.7  ch15=72.9
+ch19=76.4 ch21=65.1 ch23=64.2 ch25=89.3 ch28=133.0 ch29=62.7
+
+ch28（銀山都中継局の割当）は**電力は最も高いのに TMCC 同期 0.67 で偽ロック**
+だった（実測 2026-10-04 01:57）。1seg ではなく混線なので一覧から外した。
+ch13（NHK教育）は電力が 1.6 で受信圏外。
+
+_Uses._
+  - ゲインは `-g 5`（自動でも 0 でも 8bit ADC が飽和する。commit 6d62952）
+  - bin offset は 308 を固定（1 bin = 992 Hz の量子化。実測で全チャンネル
+    とも 308。探索を省略してロックを 78 秒 → 16 秒に短縮。commit 236ab6f）
+
+使い方:
+  ~/oneseg-rs/scripts/oneseg_gui.py
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+from tkinter import font as tkfont
+from tkinter import ttk
+
+HOME = os.path.expanduser("~")
+REPO = os.path.join(HOME, "oneseg-rs")
+LIVE_SH = os.path.join(REPO, "scripts", "live_play_direct.sh")
+STOP_SH = os.path.join(REPO, "scripts", "stop_live.sh")
+SEGOFF_FILE = "/tmp/isdbt_segoff"
+LOCK_LOG = "/tmp/isdbt_lock.log"
+STATE_FILE = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")),
+    "oneseg-rs", "gui_state.json")
+
+# 札幌（手稲山）親局。ch, 中心周波数 Hz, 実測電力, 局名, リモコン番号
+CHANNELS = [
+    (13, 473_142_857,  1.6, "NHK教育", 2),
+    (14, 479_142_857, 75.7, "TVh", 7),
+    (15, 485_142_857, 72.9, "NHK総合", 3),
+    (19, 509_142_857, 76.4, "HBC", 1),
+    (21, 521_142_857, 65.1, "STV", 5),
+    (23, 533_142_857, 64.2, "HTB", 6),
+    (25, 545_142_857, 89.3, "UHB", 8),
+]
+
+BG = "#1e1e26"
+FG = "#e6e6ef"
+ACCENT = "#7aa2f7"
+OK = "#9ece6a"
+WARN = "#e0af68"
+ERR = "#f7768e"
+MUTED = "#565f73"
+BTN_BG = "#2a2a37"
+BTN_ACTIVE = "#3a3a4a"
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as fh:
+            d = json.load(fh)
+    except (OSError, ValueError):
+        d = {}
+    try:
+        return {int(k): v for k, v in (d.get("names") or {}).items()}, \
+            int(d.get("last_index", 2))
+    except (TypeError, ValueError):
+        return {}, 2
+
+
+def save_state(names, last_index):
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump({"names": {str(k): v for k, v in names.items()},
+                   "last_index": last_index}, fh, ensure_ascii=False, indent=1)
+    os.replace(tmp, STATE_FILE)
+
+
+def alive(name):
+    return subprocess.run(["pgrep", "-x", name],
+                          capture_output=True).returncode == 0
+
+
+class LockWatcher(threading.Thread):
+    """`/tmp/isdbt_lock.log` を追い、UI に状態を流す。
+
+    「再取得」は毎フレーム出る progress なのでこれは流さない（ログが
+    progress で埋まって何も読めなくなる）。
+    """
+
+    daemon = True
+
+    def __init__(self, out):
+        super().__init__()
+        self.out = out
+        self.stop_flag = threading.Event()
+        self.pos = 0
+
+    def run(self):
+        beat = 0.0
+        while not self.stop_flag.is_set():
+            try:
+                sz = os.path.getsize(LOCK_LOG)
+                if sz < self.pos:
+                    self.pos = 0
+                if sz > self.pos:
+                    with open(LOCK_LOG, "rb") as fh:
+                        fh.seek(self.pos)
+                        chunk = fh.read(sz - self.pos)
+                    self.pos = sz
+                    for raw in chunk.split(b"\n"):
+                        line = raw.decode("utf-8", "replace").strip()
+                        if line:
+                            self.out(line)
+            except OSError:
+                pass
+            now = time.time()
+            if now - beat >= 15:
+                beat = now
+                self.out("__beat__")
+            time.sleep(0.4)
+
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        root.title("1seg 札幌（oneseg-rs）")
+        root.configure(bg=BG)
+        root.geometry("480x320")
+        root.resizable(False, False)
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+        # ffplay の映像ウィンドウが前面にある時も操作できるよう、常に手前に
+        # 置く。topmost は「他のアプリに隠れない」意味なので要件どおり。
+        root.attributes("-topmost", True)
+
+        f = tkfont.Font(family="Sans", size=11)
+        fb = tkfont.Font(family="Sans", size=20, weight="bold")
+        fs = tkfont.Font(family="Sans", size=9)
+
+        self.names, self.index = load_state()
+        self.index = max(0, min(self.index, len(CHANNELS) - 1))
+
+        self.lbl_state = tk.Label(root, text="停止中", font=fb, bg=BG, fg=MUTED)
+        self.lbl_state.pack(pady=(16, 2))
+        self.lbl_ch = tk.Label(root, text="", font=f, bg=BG, fg=FG)
+        self.lbl_ch.pack()
+        self.lbl_detail = tk.Label(root, text="", font=fs, bg=BG, fg=MUTED)
+        self.lbl_detail.pack(pady=(2, 12))
+
+        mid = tk.Frame(root, bg=BG)
+        mid.pack()
+        tk.Button(mid, text="▲ CH", width=12, font=f, bg=BTN_BG, fg=FG,
+                  activebackground=BTN_ACTIVE, activeforeground=FG,
+                  relief="flat", bd=0, pady=8,
+                  command=self.prev_channel).pack(side="left", padx=6)
+        tk.Button(mid, text="▼ CH", width=12, font=f, bg=BTN_BG, fg=FG,
+                  activebackground=BTN_ACTIVE, activeforeground=FG,
+                  relief="flat", bd=0, pady=8,
+                  command=self.next_channel).pack(side="left", padx=6)
+
+        bot = tk.Frame(root, bg=BG)
+        bot.pack(pady=14)
+        self.btn_play = tk.Button(
+            bot, text="▶ 再生", width=12, font=f, bg="#2a4a2a", fg=OK,
+            activebackground="#3a5a3a", activeforeground=OK,
+            relief="flat", bd=0, pady=8, command=self.play)
+        self.btn_play.pack(side="left", padx=6)
+        tk.Button(bot, text="■ 停止", width=12, font=f, bg="#4a2a2a", fg=ERR,
+                  activebackground="#5a3a3a", activeforeground=ERR,
+                  relief="flat", bd=0, pady=8,
+                  command=self.stop).pack(side="left", padx=6)
+
+        self.lbl_log = tk.Label(root, text="", font=fs, bg=BG, fg=MUTED,
+                                anchor="w", justify="left")
+        self.lbl_log.pack(fill="x", padx=16)
+
+        root.bind("<Up>", lambda _e: self.prev_channel())
+        root.bind("<Down>", lambda _e: self.next_channel())
+        root.bind("<Prior>", lambda _e: self.prev_channel())
+        root.bind("<Next>", lambda _e: self.next_channel())
+        root.bind("<space>", lambda _e: self.play())
+        root.bind("<Escape>", lambda _e: self.stop())
+
+        self.watcher = LockWatcher(self.on_lock_line)
+        self.watcher.start()
+        self.refresh()
+        self.root.after(400, self.poll_status)
+
+    # ---------- 表示 ----------
+    def refresh(self):
+        ch, freq, power, station, remote = CHANNELS[self.index]
+        name = self.names.get(ch) or station
+        self.lbl_ch.config(text=f"{name}    ch{ch}")
+        self.lbl_detail.config(
+            text=f"{freq/1e6:.3f} MHz ・ リモコン {remote} ・ "
+                 f"実測電力 {power:.0f}")
+
+    def playing(self):
+        return alive("stream_decode") and alive("ffplay")
+
+    def poll_status(self):
+        if self.playing():
+            self.lbl_state.config(text="● 受信中", fg=OK)
+            self.btn_play.config(text="↻ 再起動")
+            # ffplay が起動すると自身にフォーカスを奪う。
+            # `-topmost` だけでは Mutter 側で尊重されないことがあるので、
+            # 定期的に手前へ持ち上げる。
+            try:
+                self.root.lift()
+            except tk.TclError:
+                pass
+        else:
+            if self.lbl_state.cget("fg") != MUTED:
+                self.lbl_state.config(text="停止中", fg=MUTED)
+            self.btn_play.config(text="▶ 再生")
+        self.root.after(1000, self.poll_status)
+
+    def on_lock_line(self, line):
+        """LockWatcher スレッドから呼ばれる。Tk は main thread 専用なので、
+        `after()` でメインスレッドへ転送する必要がある。
+
+        mainloop が回っていないテスト実行（`root.update()` なし）では
+        `after()` が `RuntimeError: main thread is not in main loop` を
+        投げるので、その場合は何もせず捨てる（GUI が見えない場面なので）。
+        """
+        msg = re.sub(r"^\[[^\]]*\]\s*", "", line)
+
+        def apply():
+            if msg == "__beat__":
+                return
+            if "bin offset=" in msg:
+                m = re.search(r"TMCC同期=([\d.]+)", msg)
+                rs = re.search(r"RS復号率=([^ ]+)", msg)
+                parts = []
+                if m:
+                    parts.append(f"TMCC同期 {m.group(1)}")
+                if rs:
+                    parts.append(f"RS {rs.group(1)}")
+                self.lbl_log.config(
+                    text=("bin offset 確定  " + "  ".join(parts))[:64],
+                    fg=ACCENT)
+            elif "SPS/PPS/IDR検出" in msg or "ロック→" in msg:
+                self.lbl_state.config(text="● 受信中", fg=OK)
+                self.lbl_log.config(text="復調完了・再生中", fg=OK)
+            elif "lock_params" in msg:
+                self.lbl_log.config(text="パラメータ最適化中…", fg=WARN)
+        # Tk は main thread 専用。mainloop が回っていない（テスト実行など）
+        # 場合は転送できないので捨てる。`after` が例外を投げる前に判定する。
+        try:
+            self.root.after(0, apply)
+        except (RuntimeError, tk.TclError):
+            pass
+
+    # ---------- 操作 ----------
+    def _goto(self, i):
+        i = max(0, min(i, len(CHANNELS) - 1))
+        if i == self.index:
+            return
+        self.index = i
+        save_state(self.names, self.index)
+        self.refresh()
+        if self.playing():
+            self.play()
+
+    def next_channel(self):
+        self._goto(self.index + 1)
+
+    def prev_channel(self):
+        self._goto(self.index - 1)
+
+    def play(self):
+        _ch, freq, _p, _s, _r = CHANNELS[self.index]
+        # bin offset を固定する（commit 236ab6f）。実測で全 ch とも 308。
+        with open(SEGOFF_FILE, "w") as fh:
+            fh.write("308\n")
+        self.lbl_state.config(text="… 起動中", fg=WARN)
+        self.lbl_log.config(text="停止してから切り替えます…", fg=WARN)
+        self.root.update_idletasks()
+
+        # **ffplay を明示的に kill してから起動する。**
+        # 単に `live_play_direct.sh` を呼ぶだけだと、ffplay が前のチャンネルの
+        # TS を開いたまま残って新しい TS を読まない（実測: 切替しても前の
+        # チャンネルしか出ない）。ffplay は FIFO を open した状態でブロックして
+        # いるので、kill して FIFO を作り直すのが確実。
+        subprocess.run(["bash", STOP_SH], capture_output=True)
+        # プロセスが実際に死ぬまで待つ（stop_live.sh は kill した直後に
+        # 報告するので、待たずに起動すると競合する）。
+        for _ in range(30):
+            if not self.playing():
+                break
+            time.sleep(0.1)
+
+        subprocess.Popen(["bash", LIVE_SH, str(freq)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+
+    def stop(self):
+        self.lbl_state.config(text="停止中", fg=MUTED)
+        self.lbl_log.config(text="停止しています…", fg=WARN)
+        self.root.update_idletasks()
+        subprocess.run(["bash", STOP_SH], capture_output=True)
+
+    def on_close(self):
+        """ウィンドウを閉じたら受信も止める（ffplay を孤児にしない）。"""
+        self.watcher.stop_flag.set()
+        try:
+            if self.playing():
+                subprocess.run(["bash", STOP_SH], capture_output=True,
+                               timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        self.root.destroy()
+
+
+def main():
+    if not os.path.exists(LIVE_SH):
+        sys.exit(f"{LIVE_SH} が見つかりません")
+    # 前回の孤児を掃除してから開く
+    if alive("stream_decode") or alive("ffplay"):
+        subprocess.run(["bash", STOP_SH], capture_output=True)
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

@@ -36,8 +36,8 @@ FREQ="${1:-485142857}"
 # rail を最小化できる -g 5 が実測最適。
 GAIN="${GAIN:-5}"
 IQFIFO=/tmp/isdbt_iq.fifo
-IQFILE=/tmp/isdbt_live.iq
-TSFIFO=/tmp/isdbt_ts.fifo
+IQFILE=""      # 周波数ごとに決まる（下で設定）
+TSFIFO=""      # 周波数ごとに決まる（下で設定）
 LOG=/tmp/isdbt_live.log
 PLOG=/tmp/isdbt_ffplay.log
 ALIVE=/tmp/isdbt_writer.alive
@@ -64,17 +64,27 @@ WATCH_PID=$!
 echo "$WATCH_PID" > "$PIDF"
 echo "lock_watch=$WATCH_PID  →  tail -f /tmp/isdbt_lock.log"
 
-rm -f "$IQFIFO" "$TSFIFO" "$ALIVE"
-mkfifo "$IQFIFO"; mkfifo "$TSFIFO"
+rm -f "$IQFIFO" "$ALIVE"
 : > "$LOG"; : > "$PLOG"
 
-# IQ ファイルは**消さない**。前回受信した IQ を先頭に読んで追従下去るので、
-# 既に 160 MB たまっていれば数秒でロックできる。
+# IQ ファイルと TS FIFO は**チャンネルごとに分離**する。
 #
-# 消していたのは **78 秒待つのに直結していた**（実測 2026-10-04 01:12）。
-# 復調は 2 MB/s で溜め直す必要があり、ロックまでに 78 秒 = 約 160 MB。
-# TS ファイルは問題ないので、古い IQ を溜め込んでも害はない。
-# 保持量は IQ_KEEP で制限する（既定 400 MB）。
+# IQ_KEEP で保持してロックを 78 秒 → 16 秒に短縮するのは**同じチャンネルを
+# 再起動するときだけ**。チャンネルを切り替えると古い IQ が混ざるので、
+# ファイル名を周波数ごとに分ける（`/tmp/isdbt_iq_<freq>.iq`）。
+#
+# **これが「切替しても前のチャンネルしか出ない」真因**（実測 2026-10-04）。
+#  - IQ ファイルが ch15 のままだと、ch19 に切り替えても stream_decode は
+#    まず ch15 の古いデータから復調し始める。bin offset 探索は新しい周波数で
+#    走るので TMCC 同期は 1.000 になるのに、中身は前のチャンネルになる。
+#  - TS FIFO を共有していると、前チャンネルの TS が FIFO に残留して
+#    ffplay がそちらを読み続ける。
+#
+# 検証: ch19 単独で IQ を取り直すと RS 0.926 / PTS 差 -0.009 秒で正常。
+#       チャンネルの TS はハッシュが全部違う（f0a5/eb36/b3c5…）ので
+#       復調自体は正しく、経路の残留だけが問題だった。
+IQFILE="/tmp/isdbt_iq_${FREQ}.iq"
+TSFIFO="/tmp/isdbt_ts_${FREQ}.fifo"
 IQ_KEEP="${IQ_KEEP:-400000000}"
 if [ -f "$IQFILE" ]; then
   sz=$(stat -c%s "$IQFILE" 2>/dev/null || echo 0)
@@ -84,6 +94,12 @@ if [ -f "$IQFILE" ]; then
     echo "IQ ファイルを $IQ_KEEP バイトに切り詰め"
   fi
 fi
+
+# FIFO は TSFIFO が確定してから作る。**`rm -f` より後ろに置く。**
+# 順序を逆にすると古い FIFO が消えずに残り、`mkfifo` が `File exists` で
+# 失敗して ffplay が起動しない（実測 2026-10-04 02:34「画像が出ない」）。
+rm -f "$TSFIFO"
+mkfifo "$IQFIFO"; mkfifo "$TSFIFO"
 
 # 1) rtl_sdr → IQFIFO → IQFILE（append）。stream_decode は --follow で
 #    IQFILE を追従して読むので、生 IQ はここで溜め込む。
