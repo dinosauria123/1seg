@@ -86,7 +86,27 @@ DEC_PID=$!
 sleep 1
 
 # 4) TS FIFO を ffplay に直接渡す（HTTP サーバなし）
-nohup ffplay -fflags nobuffer -flags low_delay -framedrop \
+#
+# **A/V 同期について（2026-10-04 実測）**
+#
+# 現在の設定: `-fflags nobuffer` を外し、`-probesize`/`-analyzeduration`
+# を 1 MB / 1 秒に絞った設定。修正前は音声が 4 秒以上遅れていた。
+#
+# 真因は **stream_decode 側の PtsNormalizer** で、ffplay のオプションでは
+# 直らない。PTS を PID ごとに正規化していたため、映像と音声の放送側基準が
+# 3.31 時間（11930.46 秒）離れていた。`crates/isdbt-dsp/src/ts.rs` で
+# base を PID ごとに持つ設計から、全 PID 共有の単一 base に変えた。
+#
+# 修正前後の実測（`scripts/diag/ts_av_offset.py`）:
+#     修正前  映像 26890.15 s / 音声 38820.62 s  差 **+11930.46 s**
+#     修正後  映像/音声                        差 **-0.017 s**
+# ユーザー確認: 「音声が画像と一致した」
+#
+# なお `aq`（ffplay の音声キュー）は約 440 KB で平衡するが、これは
+# ファイル入力でも同程度なので SDL/PipeWire 側の通常バッファで、
+# 映像/音声の相対関係には影響しない（A-V は ±0.012 s）。
+nohup ffplay -flags low_delay -framedrop \
+  -probesize 1000000 -analyzeduration 1000000 \
   -window_title "1seg 札幌NHK総合" \
   -f mpegts -i "$TSFIFO" > "$PLOG" 2>&1 &
 FFPLAY_PID=$!

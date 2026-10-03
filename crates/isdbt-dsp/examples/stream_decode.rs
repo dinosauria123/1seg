@@ -488,8 +488,10 @@ fn main() {
                     pcr_countdown -= pkts;
                 }
                 if pcr_countdown == 0 {
-                    // 1 TS パケット ≒ 1 ms。40 ms 周期にする。
-                    pcr_ticks = pcr_ticks.wrapping_add(27_000_000 * (pcr_period as u64) / 1000);
+                    // PCR は 27 MHz カウンタ。周期 20 パケットなら +20 ms。
+                    pcr_ticks = pcr_ticks.wrapping_add(
+                        27_000_000u64 * (pcr_period as u64) / 1000u64,
+                    );
                     pcr_cc = pcr_cc.wrapping_add(1);
                     let _ = out.write_all(&isdbt_dsp::psi::pcr_packet(
                         isdbt_dsp::psi::PID_VIDEO,

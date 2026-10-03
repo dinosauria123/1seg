@@ -110,17 +110,40 @@ pub struct ContinuityTracker {
 /// 最初に現れた PTS を基準（`base`）として、以降の PES からは `base` を
 /// 引いた相対値を書き込む。PTS の 33 bit 折り返しは mod で吸収する。
 ///
-/// 基準は PID ごとに持つ。映像と音声で放送側の時刻基準が僅かに違うことが
-/// あり、共通化すると映像と音声がずれる。
+/// # 基準は PID ごとに取らない（実測 2026-10-04 で発見）
+///
+/// 以前は PID ごとに `base` を取る設計だった（PID 間で時刻基準が僅かに
+/// 違うという想定）。**その想定は 1seg では成り立たない。**
+///
+/// 実測（`/tmp/live_test.ts`、札幌NHK総合、`-g 5`）:
+///     映像 PID 0x0581  base = 2420113653 (26890.15 s)
+///     音声 PID 0x0583  base = 3493855480 (38820.62 s)
+///     相差 **11930.46 秒 = 3.31 時間**
+///
+/// `rel = pts − base` は PID ごとに正しく 0 から始まるので，各自は 0
+/// 起点に見える。しかし**二つの起点が 3.31 時間離れている**。PCR を
+/// master clock にするプレイヤーはこれを「音声が 3.31 時間後に始まる
+/// ES」と解釈し、音声だけが極端に遅れる。
+///
+/// # 做法
+///
+/// **単一のグローバル `base`**（最初に現れた PTS。映像が先行することが多い）
+/// 1 つだけ持ち、全 PID で共有する。これで全 ES の PTS が同じ時間軸に載る。
+/// 33 bit の折り返しは mod で吸収するので、base の選択自体は結果に
+/// 影響しない。
 
 #[derive(Default)]
 pub struct PtsNormalizer {
-    base: std::collections::HashMap<u16, u64>,
+    /// 全 PID で共有する単一の基準 PTS。
+    ///
+    /// PID ごとの map ではない理由はこの struct の docstring を参照。
+    /// 1seg の実測では映像と音声の放送側基準が 3.31 時間離れていた。
+    base: Option<u64>,
 }
 
 impl PtsNormalizer {
     pub fn new() -> Self {
-        Self { base: std::collections::HashMap::new() }
+        Self { base: None }
     }
 
     /// `ts` 内の全 PES ヘッダの PTS を平行移動する。
@@ -191,8 +214,11 @@ impl PtsNormalizer {
             }
             let b = off + 9;
             let pts = read_ts(&ts[b..b + 5]);
-            let pid = ((b1 as u16 & 0x1f) << 8) | ts[i + 2] as u16;
-            let base = *self.base.entry(pid).or_insert(pts);
+            // base は**全 PID 共有**。PID ごとに取ると 1seg では映像と音声の
+            // 放送側基準が 3.31 時間離れてしまい（実測 2026-10-04）、
+            // PCR を master clock にするプレイヤーが「音声が 3.31 時間後」
+            // と解釈して音聲だけが極端に遅れる。
+            let base = *self.base.get_or_insert(pts);
             // base を引いた相対値。33 bit 折り返しは mod で吸収。
             let rel = (pts + p - base) % p;
             write_ts(&mut ts[b..b + 5], rel);
@@ -308,6 +334,61 @@ mod pts_tests {
         n.normalize(&mut buf);
         assert_eq!(read_ts(&buf[14..19]), 0);
         assert_eq!(read_ts(&buf[188 + 14..188 + 19]), 90_000, "1 秒ぶんの差が保たれる");
+    }
+
+    /// 実測 2026-10-04 の回帰テスト。
+    ///
+    /// 1seg の放送側 PTS は映像と音声で基準が 3.31 時間離れている:
+    ///     映像 PID 0x0581  2420113653 (26890.15 s)
+    ///     音声 PID 0x0583  3493855480 (38820.62 s)
+    ///     差 11930.46 s
+    ///
+    /// 以前は base を PID ごとに取っていたため、両方の `rel` が 0 に
+    /// なるものの**起点が 3.31 時間離れたまま**だった。ffplay が PCR を
+    /// master clock にして PTS を評価すると、音声だけが 3.31 時間後に
+    /// 始まる ES と解釈され、極端に遅れていた（体感で「音だけ 4 秒遅れ」）。
+    ///
+    /// base を全 PID 共有にすれば差は放送側の値のまま保たれる。
+    fn pes_with_pts(pid: u16, pts: u64) -> [u8; 188] {
+        let mut pkt = [0xffu8; 188];
+        pkt[0] = 0x47;
+        pkt[1] = 0x40 | ((pid >> 8) as u8 & 0x1f);
+        pkt[2] = (pid & 0xff) as u8;
+        pkt[3] = 0x10; // payload only
+        pkt[4..7].copy_from_slice(&[0x00, 0x00, 0x01]);
+        pkt[7] = 0xe0; // video stream_id
+        pkt[8] = 0x00;
+        pkt[9] = 0x00;
+        pkt[10] = 0x80;
+        pkt[11] = 0x80;
+        pkt[12] = 0x05;
+        pkt[13..18].copy_from_slice(&ts_field(pts));
+        pkt
+    }
+
+    #[test]
+    fn pts_normalizer_shares_base_across_pids() {
+        const VIDEO: u64 = 2_420_113_653;
+        const AUDIO: u64 = 3_493_855_480;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&pes_with_pts(0x0581, VIDEO));
+        buf.extend_from_slice(&pes_with_pts(0x0583, AUDIO));
+
+        let mut n = PtsNormalizer::new();
+        n.normalize(&mut buf);
+
+        let v = read_ts(&buf[13..18]);
+        let a = read_ts(&buf[188 + 13..188 + 18]);
+
+        assert_eq!(v, 0, "映像は base なので 0");
+        // 共有 base なら、音声は放送側の差 11930.46 秒だけ後になる。
+        // PID ごとに base を取っていた頃（= 0）ならこの assert は失敗する。
+        assert_eq!(a, (AUDIO + PTS_MOD - VIDEO) % PTS_MOD,
+                   "音声は映像から 11930.46 秒後の時刻になる");
+        // 両者の差は放送側の値を保つ。
+        let diff = (a + PTS_MOD - v) % PTS_MOD;
+        assert_eq!(diff, (AUDIO + PTS_MOD - VIDEO) % PTS_MOD);
     }
 }
 
