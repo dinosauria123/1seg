@@ -145,11 +145,6 @@ nohup /usr/bin/python3 "$HOME/oneseg-rs/scripts/iq_trim.py" \
 TRIM_PID=$!
 echo "$TRIM_PID" >> "$PIDF"
 
-# 2) rtl_sdr を起動
-rtl_sdr -f "$FREQ" -s 1015873 -g "$GAIN" "$IQFIFO" >>"$LOG" 2>&1 &
-sleep 2
-echo -n 1 > "$ALIVE"
-
 # 2b) 緑 LED を点灯（ドングルが給電され 動作中であることを示す）
 #
 # **GPIO で緑 LED は制御できる**（実測 2026-10-04、DS-DT-305BK）:
@@ -159,15 +154,26 @@ echo -n 1 > "$ALIVE"
 # **close 後も点灯は保持される**（実測）:
 #   `rtlsdr_set_bias_tee_gpio()` で Hi に設定 → `rtlsdr_close()` で
 #   USB ハンドルを閉じても、demod の GPIO レジスタは保持される。
-#   さらに **rtl_sdr を起動しても消えない**（実測 2026-10-04 12:5x）:
-#   demod の再初期化で GPIO はリセットされない。
+#   さらに **rtl_sdr を起動しても消えない**（実測 2026-10-04 12:5x）。
 #
-# だから `led_ctl.py set` は「0.4 秒で設定してすぐ解放」だけを行い、
-# 常駐しない。デバイス排他（`usb_claim_interface error -6`）も起きない。
+# **排他の問題**（実測 2026-10-04 13:0x）:
+#   この位置（rtl_sdr 起動の直後）では `led_ctl.py` が `open` に失敗する。
+#   `rtl_sdr` がデバイスを掴んでいるため（`usb_claim_interface error -6`）。
+#   よって **rtl_sdr を起動する前**、つまり GPIO 設定後に rtl_sdr を
+#   起動する順序にする。GPIO は rtl_sdr 起動後も保持されるので
+#   （上の実測）順序を入れ替えても点灯は維持される。
+#
+# `LED=0` で無効化。
 if [ "${LED:-1}" = "1" ]; then
+  # rtl_sdr はまだ起動していないので、デバイスは空いている。
   /usr/bin/python3 "$HOME/oneseg-rs/scripts/led_ctl.py" set >>"$LOG" 2>&1 \
     || echo "警告: LED 点灯に失敗（続行する）" >&2
 fi
+
+# 2) rtl_sdr を起動
+rtl_sdr -f "$FREQ" -s 1015873 -g "$GAIN" "$IQFIFO" >>"$LOG" 2>&1 &
+sleep 2
+echo -n 1 > "$ALIVE"
 
 # 3) stream_decode --follow で IQFILE を追従読取 → TSFIFO
 #
