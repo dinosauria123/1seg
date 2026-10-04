@@ -150,6 +150,25 @@ rtl_sdr -f "$FREQ" -s 1015873 -g "$GAIN" "$IQFIFO" >>"$LOG" 2>&1 &
 sleep 2
 echo -n 1 > "$ALIVE"
 
+# 2b) 緑 LED を点灯（ドングルが給電され 動作中であることを示す）
+#
+# **GPIO で緑 LED は制御できる**（実測 2026-10-04、DS-DT-305BK）:
+#   全 8 GPIO を Hi に固定すると点灯、Lo で消灯。1本ずつ Hi/Lo を高速で
+#   切り替える方式では観察できなかった（点滅が速すぎて目では追えない）。
+#
+# **close 後も点灯は保持される**（実測）:
+#   `rtlsdr_set_bias_tee_gpio()` で Hi に設定 → `rtlsdr_close()` で
+#   USB ハンドルを閉じても、demod の GPIO レジスタは保持される。
+#   さらに **rtl_sdr を起動しても消えない**（実測 2026-10-04 12:5x）:
+#   demod の再初期化で GPIO はリセットされない。
+#
+# だから `led_ctl.py set` は「0.4 秒で設定してすぐ解放」だけを行い、
+# 常駐しない。デバイス排他（`usb_claim_interface error -6`）も起きない。
+if [ "${LED:-1}" = "1" ]; then
+  /usr/bin/python3 "$HOME/oneseg-rs/scripts/led_ctl.py" set >>"$LOG" 2>&1 \
+    || echo "警告: LED 点灯に失敗（続行する）" >&2
+fi
+
 # 3) stream_decode --follow で IQFILE を追従読取 → TSFIFO
 #
 # **bin offset はチャンネルごとに違う**（実測 2026-10-04 03:0x）。

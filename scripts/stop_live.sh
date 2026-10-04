@@ -93,6 +93,16 @@ if [ "${freed:-0}" -gt 0 ]; then
 fi
 
 sleep 1
+
+# --- 4) 緑 LED を消灯 ---
+#
+# ドングルが給電され 動作中であることを示す LED（実測 2026-10-04:
+# 全 8 GPIO を Hi で点灯、Lo で消灯。close 後も保持される）。
+# 停止したら消灯する。
+if [ "${LED:-1}" = "1" ]; then
+  /usr/bin/python3 "$HOME/oneseg-rs/scripts/led_ctl.py" unset >/dev/null 2>&1 || true
+fi
+
 echo "停止完了。残存:"
 pgrep -x vlc >/dev/null 2>&1 && echo "  vlc: 残りあり" || echo "  vlc: なし"
 pgrep -x ffplay >/dev/null 2>&1 && echo "  ffplay: 残りあり" || echo "  ffplay: なし"
