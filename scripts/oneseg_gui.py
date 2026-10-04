@@ -335,7 +335,20 @@ class App:
                 break
             time.sleep(0.1)
 
-        subprocess.Popen(["bash", LIVE_SH, str(freq)],
+        # `ISDBT_SEGOFF_RETRY=0` で bin offset の ±リトライを無効化する。
+        #
+        # なぜ 0 にするか（実測タイムライン 2026-10-04 13:31）:
+        #     0.0s  起動
+        #    13.9s  bin offset 確定 TMCC同期=1.000
+        #    19.9s  SPS/PPS/IDR 検出（映像出力開始）
+        # リトライ（既定 ±2）が約 7 秒を占めていた。bin offset の実測値は
+        # `/tmp/isdbt_segoff_<freq>` に保存済みなので、一度の試行で当てれば
+        # 映像開始まで 13 秒になる。
+        #
+        # 偽値だった場合の兆候: TMCC 同期が 0.95 未満のまま進まない。
+        # そのときは `SEGOFF_RETRY=2` で再実行する。
+        env = dict(os.environ, ISDBT_SEGOFF_RETRY="0")
+        subprocess.Popen(["bash", LIVE_SH, str(freq)], env=env,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)
 

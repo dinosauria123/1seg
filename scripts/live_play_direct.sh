@@ -252,7 +252,8 @@ sleep 1
 # 映像/音声の相対関係には影響しない（A-V は ±0.012 s）。
 nohup ffplay -flags low_delay -framedrop \
   -probesize 1000000 -analyzeduration 1000000 \
-  -window_title "1seg 札幌NHK総合" \
+  -window_title "1seg 札幌" \
+  -x 640 \
   -f mpegts -i "$TSFIFO" > "$PLOG" 2>&1 &
 FFPLAY_PID=$!
 
