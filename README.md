@@ -1,90 +1,199 @@
-# RTS_SDR — 自作ワンセグ（ISDB-T 1seg）復調器
+# oneseg-rs — 自作ワンセグ（ISDB-T 1seg）復調器
 
-RTL-SDR Blog V4 で受けた IQ から、**ISDB-T のワンセグ（1セグ）を自前で復調する**プロジェクト。
-Rust実装 → 実電波で**H.264映像まで復号**（バッチ `decode` / 連続ライブ `stream_decode`）→
-**WebAssembly でブラウザ内復調**（`web/`）まで到達。「URLを開くと（IQを渡すと）テレビが映る」。
+RTL-SDR ドングルで受けた IQ から、**ISDB-T のワンセグ（1セグメント）を自前で復調**する
+Rust プロジェクト。復調した MPEG-TS を **ffplay でそのまま再生**でき、
+tkinter の **GUI 付き**でチャンネル切替・再生・停止ができる。
+
+実測で到達しているもの:
+- **1seg 映像 + 音声のライブ復調**（H.264 320x180 15fps + HE-AAC 48kHz stereo）
+- **GUI で 7 チャンネル切替**（札幌・手稲山親局）
+- **緑 LED の GPIO 点灯**（ドングルの稼働表示）
+
+---
 
 ## なぜ自作か
 
-- フルセグ（12セグ・帯域 約5.6MHz）は RTL-SDR の約2.5MHz窓に入りきらない → 1本では不可。
-- ワンセグ（中央1セグ・約429kHz）なら窓に収まり、無スクランブルなのでそのまま再生できる。
-- 既存の `gr-isdbt` は GNU Radio 3.7〜3.8＋SWIG 世代の化石ビルドで現代環境では動かしづらい → 自分で書く。
+- **フルセグ**（12 セグメント・帯域 約 5.6 MHz）は RTL-SDR の窓（約 2.4 MHz）に入りきらない
+  → 1 本のドングルでは受信不可。
+- **ワンセグ**（中央 1 セグメント・約 700 kHz 幅）なら窓に収まる。
+  しかも ISDB-T 1seg はスクランブルがかかっていないので、復号した TS をそのまま再生できる。
+- 既存の [`gr-isdbt`](https://github.com/git-artes/gr-isdbt) は GNU Radio 3.7〜3.8 + SWIG
+  世代のビルドに依存し、現代環境で動かすのが難しい。
+
+---
+
+## 参考にした既存ソフトウェア
+
+以下を**実装上の参照**として開発しました（コードの流用ではなく、
+仕様確認・段構成のリファレンスとして使っています）。
+
+| ソフトウェア | URL | ライセンス | 参考にした内容 |
+|---|---|---|---|
+| **gr-isdbt** | <https://github.com/git-artes/gr-isdbt> | GPL-3.0 | ISDB-T 固有の処理（TMCC デコード、PRBS エネルギー分散、リセット基準）。ISDB-T 圏で実際に運用されている数少ないオープンソース実装。 |
+| **DAB-Radio** | <https://github.com/williamyang98/DAB-Radio> | （upstream のものを参照） | GNU Radio に依存しない**単体実装**の手本。設計判断（ブロック分割、エラー処理、構成の簡潔さ）の参考にした。 |
+| **rtl-sdr** | <https://github.com/rtlsdr/rtl-sdr> | GPL-3.0 | `rtlsdr_set_bias_tee_gpio()` などの低レベル API の GPIO レジスタ定義。緑 LED の制御に使った。 |
+| **librtlsdr**（同上の一部） | <https://github.com/rtlsdr/rtl-sdr> | GPL-3.0 | Demod レジスタの GPIO（`SYS_GPIO_OUT_VAL` = 0x3001 など）。Linux カーネルの `dvb-usb-v2/rtl28xxu.h` と同じ定義。 |
+
+一次資料（仕様の原文）:
+
+| 資料 | 内容 |
+|---|---|
+| **ARIB STD-B31** | 地上デジタル伝送方式（ISDB-T）。伝送パラメータ、TMCC の構造、セグメント構成の一次規格。 |
+| **ARIB STD-B24** | 音声伝送方式（LATM/HE-AAC の 1seg での運用）。 |
+
+既存ソフトウェアの Clone 方法（`ref/` は `.gitignore` 済み）:
+
+```bash
+git clone --depth 1 https://github.com/git-artes/gr-isdbt.git ref/gr-isdbt
+git clone --depth 1 https://github.com/williamyang98/DAB-Radio.git ref/DAB-Radio
+```
+
+> 参照実装には ISDB-T 圏（ブラジル・日本）で使用されているiha软件が含まれます。
+> 本プロジェクトは **合法な地上デジタル放送の受信**（自分の地域で受信できる放送）を
+> 対象としており、復調そのものは暗号解読を含みません。
+
+---
 
 ## 段構成（信号の流れ）
 
-| 段 | 内容 | 状態 |
+| 段 | 内容 | 実装ファイル |
 |----|------|------|
-| ① | RF入力（rtl_sdr の生IQ → 複素サンプル） | ✅ `iq.rs` |
-| ② | **OFDM同期**（CP自己相関でシンボル境界＋小数CFO） | ✅ `sync.rs`（実装＋合成IQ＋実機で検証） |
-| ③ | **チャネル等化**（スキャッタードパイロット） | ✅ `pilots.rs`/`equalize.rs`（実機ch17でQPSK確認） |
-| ④ | デマップ＋デインターリーブ（要TMCC） | ✅ `tmcc.rs`/`deinterleave.rs`/`demap.rs`（TMCC・周波数/時間デインタ・QPSKデマップ・bitデインタ） |
-| ⑤ | FEC（Viterbi＋RS(204,188)） | ✅ `viterbi.rs`（実機でFECロック・一致率1.000）／`rs.rs`（RS復号・実機99.7%成功） |
-| ⑥ | TS出力 | ✅ `ts.rs`（**実電波→MPEG-TS、RS成功99.7%、H.264 320×180＋AAC を ffmpeg で再生確認**） |
+| ① | RF 入力（rtl_sdr の生 IQ → 複素サンプル） | `iq.rs` |
+| ② | **OFDM 同期**（CP 自己相関でシンボル境界 + 小数 CFO） | `sync.rs` |
+| ③ | **チャネル等化**（スキャッタードパイロット） | `pilots.rs` / `equalize.rs` |
+| ④ | TMCC 復号 → デマップ / デインターリーブ | `tmcc.rs` / `deinterleave.rs` / `demap.rs` |
+| ⑤ | FEC（Viterbi + RS(204,188)） | `viterbi.rs` / `rs.rs` |
+| ⑥ | TS 出力（PSI 合成、PTS 正規化、discontinuity 注入） | `ts.rs` / `stream.rs` |
 
-> **🎉 完成（2026-07-01）**：本線の `decode` 例が実IQ（壁アンテナ）を **MPEG-TS** に単一パスで復号
-> （RS成功99.7%）。ffprobe で **H.264 映像 320×180 ＋ AAC 音声 48kHz** を確認、フレーム抽出で
-> **実際のテレビ映像**（関西テレビ）を取り出せた。IQ → 同期 → 等化 → TMCC → デインタ → Viterbi
-> → 逆拡散 → RS → TS の全段が実電波で貫通。
-> ```bash
-> cargo run --release -p isdbt-dsp --example decode -- cap.iq 1015873 out.ts 11000
-> ffmpeg -ss 5 -i out.ts -frames:v 1 frame.png   # 映像を1枚抜く
-> ```
-> 補足：エネルギー拡散のリセットは **1 OFDMフレーム = 64 RSブロックごと**
-> （204sym × 384carrier × 2bit × 2/3 ÷ 8 ÷ 204 = 64）。
->
-> **リアルタイム（ストリーミング）**：`stream_decode` は IQ(stdin/file)→TS(stdout/file) を
-> 単一パスで復号（`ViterbiStreaming` 使用）。**実電波のライブパイプで動作確認済み（99%復号）**：
-> ```bash
-> # ライブ受信→復号（head でクリーンにEOFを渡すのがコツ。timeout だと閉じ方が不安定）
-> rtl_sdr -f 497142857 -s 1015873 -g 30 - | head -c 40000000 | \
->   cargo run --release -q -p isdbt-dsp --example stream_decode -- - live.ts
-> ffmpeg -ss 6 -i live.ts -frames:v 1 frame.png     # ライブ映像を1枚
-> ```
-> 表示端末なら末尾を `| ffplay -` にすれば**連続ライブ再生**（stdin逐次読み・都度flush・
-> バッファはcursor＋compactで有界なので無限ストリームOK）。実電波のライブニュースを
-> 連続復号して映像化できることを確認済み。
-> `decode`＝バッチ本線、`stream_decode`＝リアルタイム/連続ライブ。他の `examples/` は各段の診断用。
->
-> **ブラウザ版（WASM+WebUSB）**：`crates/isdbt-wasm` を WebAssembly 化し、ブラウザ内で
-> IQ→MPEG-TS を復号→`mpegts.js` で再生。Nodeで**ネイティブと同一のH.264 320×180+AAC**を検証済み。
-> 詳細と起動手順は [web/README.md](web/README.md)（`wasm-pack build … --target web` → `python3 -m http.server`）。
+エネルギー分散のリセットは **1 OFDM フレーム = 64 RS ブロックごと**
+（204sym × 384carrier × 2bit × 2/3 ÷ 8 ÷ 204 = 64）。
+
+---
+
+## 主な機能
+
+### ライブ復調（`stream_decode`）
+
+IQ（stdin / ファイル）を単一パスで復調して TS を stdout に出力。
+`--follow` でファイルの追記を追従し、`--live` で低遅延モード。
+
+```bash
+rtl_sdr -f 509142857 -s 1015873 -g 5 /tmp/iq.fifo &
+stdbuf -oL ./target/release/examples/stream_decode /tmp/iq.fifo /tmp/ts.fifo --live --follow &
+ffplay -flags low_delay -framedrop -x 640 -window_title "1seg 札幌" -f mpegts -i /tmp/ts.fifo
+```
+
+### バッチ復号（`decode`）
+
+IQ ファイルから TS を一括生成。
+
+```bash
+./target/release/examples/decode cap.iq 1015873 out.ts 12000
+ffmpeg -ss 6 -i out.ts -frames:v 1 frame.png
+```
+
+### GUI
+
+tkinter 製。▲▼ でチャンネル切替（循環）、▶/■ で再生/停止。
+
+```bash
+~/oneseg-rs/scripts/oneseg_gui.py
+```
+
+### 緑 LED の点灯
+
+ドングルの緑 LED を GPIO で制御して、ドングルの稼働を表示。
+
+```bash
+python3 scripts/led_ctl.py set      # 点灯
+python3 scripts/led_ctl.py unset    # 消灯
+```
+
+---
 
 ## ビルド & テスト
 
 ```bash
+cargo build --release
 cargo test -p isdbt-dsp
 ```
 
-## 使い方・動作仕様
+---
 
-使用上の詳細（受信可否の判定・落とし穴・診断ツール一覧）は
-[docs/OPERATION.md](docs/OPERATION.md) を参照。
+## ブラウザ版（WASM + WebUSB）
 
-特に注意すべき点が一つ: **TMCC 同期語の一致率 60〜75%（特に 68.8% = 11/16）は
-「信号が弱い」ではなく熱ノイズ由来の偽ロック**です。`FrameSync::is_true_lock()`
-（16bit同期語が全フレームで一貫＋even/odd交互＋BCH OK＋一致率95%以上）で真偽を
-判定し、`lock_search` example が「偽ロック」「本物のロック」を明示します。偽ロックは
-復調器の調整では直りません（信号が無いため）。`tmcc_probe` / `lock_search` /
-`tmcc_bitdump` の順で受信状態を確かめてから再生してください。
+`crates/isdbt-wasm` を WebAssembly 化し、ブラウザ内で IQ → MPEG-TS を復号。
+Node でネイティブと同一の H.264 320x180 + AAC を検証済み。
 
-## ハードを動かす（母艦：Ubuntu 26.04 で確認済み）
+詳細: [`web/README.md`](web/README.md)（`wasm-pack build … --target web` → `python3 -m http.server`）
 
-```bash
-sudo apt-get install -y rtl-sdr libusb-1.0-0-dev
-echo -e "blacklist dvb_usb_rtl28xxu\nblacklist rtl2832_sdr" \
-  | sudo tee /etc/modprobe.d/blacklist-rtlsdr.conf
-sudo modprobe -r rtl2832_sdr dvb_usb_rtl28xxu
-rtl_test        # → "RTL-SDR Blog V4 Detected" / "R828D" / loss 0 を確認
-```
+---
 
-## 参照
+## セットアップ
 
-- 一次資料：**ARIB STD-B31**（地上デジタル伝送方式）
-- 参照実装：`ref/gr-isdbt`（ISDB-T固有処理）、`ref/DAB-Radio`（GNU Radio非依存の単体実装の手本）
-- 開発記（ブログ）：<https://yasu-home.com/rtl-sdr-v4-ubuntu-2604-setup/>（#0 環境構築）
+インストール手順・外部依存・カーネルモジュールの blacklist などは
+**[`INSTALL.md`](INSTALL.md)** を参照。
 
-> `ref/` は別リポジトリの浅cloneで、`.gitignore` 済み。再取得：
-> ```bash
-> git clone --depth 1 https://github.com/git-artes/gr-isdbt.git ref/gr-isdbt
-> git clone --depth 1 https://github.com/williamyang98/DAB-Radio.git ref/DAB-Radio
-> ```
+---
+
+## 主な診断ツール
+
+| ツール | 用途 |
+|---|---|
+| `tmcc_probe` | 同期 → TMCC → BCH → Layer パラメータ表示（**最初に使う**） |
+| `lock_search` | 偽ロックと真ロックの明示判定 |
+| `tmcc_bitdump` | 同期語 16bit の一致ヒストグラム |
+| `rs_diag` / `ts_probe` / `ts_extract` | RS と TS 内部の掘り下げ |
+| `snr_constellation.py` | 等化出力の星座解析（C/N 測定） |
+| `agc_check.py` | 入力の飽和診断（Kurtosis / 原子 / Rayleigh 比） |
+| `seg_offset_survey.py` | bin offset の実測（チャンネルごと 1 bin ずつ） |
+
+### 偽ロックの判定（重要）
+
+TMCC 同期語の一致率 **60〜75%（特に 68.8% = 11/16）は偽ロック**であり、
+「信号が弱い」ではありません。`FrameSync::is_true_lock()` で真偽を判定します:
+
+1. 同期語 16bit が全フレームで一貫（`consistent_sync_bits == 16`）
+2. even/odd フレームが交互（`alternates`）
+3. BCH(273,191) が OK
+4. 一致率 95% 以上
+
+**偽ロックは復調器の調整では絶対に直りません**（信号が無いため）。
+C/N を確保するのはアンテナ／受信環境側の問題です。
+
+---
+
+## 主な制約・既知の問題
+
+| 項目 | 内容 |
+|---|---|
+| 受信範囲 | **1seg のみ**。フルセグ（約 5.6 MHz）は 1 本のドングルでは不可 |
+| ゲイン | **`-g 5` が最適**。`-g 0`（AGC）は ADC 飽和で復調悪化する（実測） |
+| bin offset | チャンネルごとに違う（1 bin = 992 Hz）。`/tmp/isdbt_segoff_<freq>` に保存 |
+| 保持量 | `/tmp` は tmpfs 3.6G。IQ は `captures/live/`（ext4）に置くのが安全 |
+| H.264 MB エラー | 訂正不能 0.7% の散発に由来。`discontinuity_indicator` では完全には防げない |
+| 地域 | 札幌（手稲山親局）のチャンネル一覧をハードコード。他の地域では変更が必要 |
+
+---
+
+## ドキュメント
+
+| ファイル | 内容 |
+|---|---|
+| [`INSTALL.md`](INSTALL.md) | インストール方法・外部依存・トラブルシューティング |
+| [`docs/OPERATION.md`](docs/OPERATION.md) | **仕様と使い方**（最重要。復調の段構成、落とし穴、実測値） |
+| [`docs/CONSTELLATION_SNR.md`](docs/CONSTELLATION_SNR.md) | 星座解析と C/N の関係 |
+| [`docs/DEGRADATION_INVESTIGATION.md`](docs/DEGRADATION_INVESTIGATION.md) | 復調劣化の調査記録 |
+| [`web/README.md`](web/README.md) | ブラウザ版のビルドと起動 |
+
+---
+
+## 開発記（ブログ）
+
+- <https://yasu-home.com/rtl-sdr-v4-ubuntu-2604-setup/>（#0 環境構築）
+
+---
+
+## ライセンス
+
+GPL-3.0-or-later（参照実装 `gr-isdbt` が GPL のため）。
