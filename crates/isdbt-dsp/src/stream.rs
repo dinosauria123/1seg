@@ -524,6 +524,26 @@ struct RsBlockAssembler {
 /// **これより早く検出しないと I フレームを落とす**。
 const BURST_THRESHOLD: usize = 32;
 
+/// 連続訂正不能の検出閾値を実行時に上書きする（`ISDBT_BURST_THRESHOLD=N`）。
+///
+/// 実測 2026-10-04 12:20（70秒キャプチャ、ch19 HBC）:
+/// ```
+/// [burst] max=53  dist=1:283 2:59 ... >=8:87 >=16:52 >=24:36 >=32:22 >=48:6
+/// ```
+/// 最長 53 連続（1 フレームの 83%）が 70 秒に **22 回**も起きている。
+/// つまり既定の 32 でも発火するが、I フレーム欠落は既に起きている。
+/// 壊れを早く捕まえて次の I フレームから再開させるため、下げたい。
+///
+/// 注意: 値を下げすぎると小さな穴でも発火し、demux は 2 秒黒になる回数が増える。
+/// つまり「下げる＝稳定性改善」ではない。実測で効果を確認する。
+fn burst_threshold() -> usize {
+    std::env::var("ISDBT_BURST_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| (1..=64).contains(v))
+        .unwrap_or(BURST_THRESHOLD)
+}
+
 impl RsBlockAssembler {
     fn new(phase: usize, reset_off: usize) -> Self {
         Self { buffer: Vec::with_capacity(TSP), phase, reset_off, prbs: EnergyPrbs::with_init(PRBS_INIT), block_idx: 0, rs_valid_probe: false, rs_valid: 0, rs_seen: 0, dump_target: u64::MAX, dump_span: 1, dump_enabled: false, dump_byte: Vec::new(), dump_byte_all: Vec::new(), dump_byte_pre: Vec::new(), prbs_reset_log: Vec::new(), drop_burst_hist: [0u64; 64], drop_burst_max: 0, rs_sync_ok: 0, rs_seen_decoded: 0, rs_corrected: 0, rs_bit_errors: 0, rs_symbol_errors: 0, rs_fail_reasons: [0; 4], rs_dropped: 0, rs_miscorrected: 0, rs_blocks_seen: 0, drop_burst: 0, burst_raised: false, drop_by_mod64: [0u32; 64], drop_by_mod256: [0u32; 256], drop_seen_blocks: 0 }
@@ -734,7 +754,7 @@ impl RsBlockAssembler {
                     // フレーム落ちイベント。1 回の連続につき 1 回だけ発火する
                     // （`burst_raised` で抑制）。呼び出し側が
                     // discontinuity_indicator 付き PCR パケットを注入する。
-                    if self.drop_burst >= BURST_THRESHOLD && !self.burst_raised {
+                    if self.drop_burst >= burst_threshold() && !self.burst_raised {
                         self.burst_raised = true;
                         burst = true;
                     }
@@ -2573,15 +2593,39 @@ impl StreamingDecoder {
             .unwrap_or((0, 0, 0, 0))
     }
 
-    /// 注入した discontinuity パケット数（診断用）。
-    ///
-    /// OPERATION.md §8.5: 訂正不能が `BURST_THRESHOLD`(32) 個以上連続すると
-    /// demux に「ここから状態を破棄せよ」と伝える PCR パケットを挿入する。
-    /// この件数が 0 のまま H.264 が崩れるなら、原因は「局所的な連続訂正不能」
-    /// ではなく「訂正『成功』ブロック内の散発的 bit error」と特定できる。
-    pub fn disc_count(&self) -> u64 {
-        self.disc_count
-    }
+    /// 注入した discontinuity パケット数を外から読む（診断用）。
+        ///
+        /// OPERATION.md §8.5: 訂正不能が `BURST_THRESHOLD`(32) 個以上連続すると
+        /// demux に「ここから状態を破棄せよ」と伝える PCR パケットを挿入する。
+        /// この件数が 0 のまま H.264 が崩れるなら、原因は「局所的な連続訂正不能」
+        /// ではなく「訂正『成功』ブロック内の散発的 bit error」と特定できる。
+        pub fn disc_count(&self) -> u64 {
+            self.disc_count
+        }
+
+        /// 訂正不能の連続長分布（添字 = 連続長-1、値 = 発生回数）と最長バースト。
+        ///
+        /// 画面崩れ（OPERATION.md §8.1 の未解決項）の切り分けに使う。
+        /// - `max` が `BURST_THRESHOLD`(32) 未満なら discontinuity は発火せず、
+        ///   訂正不能は**すべて散発**なので H.264 にそのまま流れる。
+        /// - `max` が大きいなら GOP 破綻（§8.4）で discontinuity が効くはず。
+        pub fn drop_burst_stats(&self) -> ([u64; 64], u64) {
+                self.pipe
+                    .as_ref()
+                    .map(|p| (p.rs_asm.drop_burst_hist, p.rs_asm.drop_burst_max))
+                    .unwrap_or(([0u64; 64], 0))
+            }
+
+        /// 訂正不能ブロックの `block_idx % 256` 分布（添字 = 位相、値 = 回数）。
+        ///
+        /// 特定の位相に偏れば PRBS リセット境界や depuncture 位相の問題、
+        /// 偏らなければ散発的な RF 雑音と判定できる。
+        pub fn drop_phase_hist(&self) -> [u32; 256] {
+            self.pipe
+                .as_ref()
+                .map(|p| p.rs_asm.drop_by_mod256)
+                .unwrap_or([0u32; 256])
+        }
 
     /// DC オフセットの追従率（0 で追従しない = 旧挙動）。
     ///
