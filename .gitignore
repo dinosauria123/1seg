@@ -8,6 +8,14 @@ Cargo.lock        # ライブラリworkspaceのため当面は無視（バイナ
 # IQキャプチャ（巨大）
 *.iq
 *.cu8
+
+# collapse 累積値（実行時生成）
+*.iq.collapsed
+*.collapsed
+
+# Python バイトコード
+__pycache__/
+*.pyc
 *.bin
 *.raw
 

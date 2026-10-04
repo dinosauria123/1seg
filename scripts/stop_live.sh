@@ -82,7 +82,7 @@ IQDIR="${IQDIR:-$HOME/oneseg-rs/captures/live}"
 for f in "$IQDIR"/isdbt_iq_*.iq /tmp/isdbt_iq_*.iq; do
   [ -f "$f" ] || continue
   sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
-  rm -f "$f"
+  rm -f "$f" "$f.collapsed"
   freed=$((freed + sz))
 done
 for f in /tmp/isdbt_ts_*.fifo; do

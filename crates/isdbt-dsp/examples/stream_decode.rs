@@ -143,9 +143,11 @@ fn main() {
     } else {
         Some(fs::File::open(&inpath).expect("in"))
     };
-    let collapsed_path = std::env::var("ISDBT_COLLAPSED").unwrap_or_else(|_| {
-        "/tmp/isdbt_collapsed".to_string()
-    });
+    // 累積値は IQ ファイルごとに `isdbt_iq_<freq>.iq.collapsed` に分かれる。
+    // 単一ファイル共有だとチャンネル切替後に前のチャンネルの値が contaminate
+    // し、pos=0 から `SeekFrom::Current(-n)` が EINVAL で失敗する
+    // （実測 2026-10-04 12:43、ch14 へ切り替えた直後に発生）。
+    let collapsed_path = format!("{inpath}.collapsed");
     let mut collapsed_seen: u64 = 0;
     let use_file = input_file.is_some();
     let stdin_lock = if use_file { None } else { Some(std::io::stdin().lock()) };

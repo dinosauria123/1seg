@@ -148,7 +148,7 @@ class App:
         self.root = root
         root.title("1seg 札幌（oneseg-rs）")
         root.configure(bg=BG)
-        root.geometry("480x320")
+        root.geometry("420x420")
         root.resizable(False, False)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         # ffplay の映像ウィンドウが前面にある時も操作できるよう、常に手前に
@@ -169,28 +169,31 @@ class App:
         self.lbl_detail = tk.Label(root, text="", font=fs, bg=BG, fg=MUTED)
         self.lbl_detail.pack(pady=(2, 12))
 
-        mid = tk.Frame(root, bg=BG)
-        mid.pack()
-        tk.Button(mid, text="▲ CH", width=12, font=f, bg=BTN_BG, fg=FG,
-                  activebackground=BTN_ACTIVE, activeforeground=FG,
-                  relief="flat", bd=0, pady=8,
-                  command=self.prev_channel).pack(side="left", padx=6)
-        tk.Button(mid, text="▼ CH", width=12, font=f, bg=BTN_BG, fg=FG,
-                  activebackground=BTN_ACTIVE, activeforeground=FG,
-                  relief="flat", bd=0, pady=8,
-                  command=self.next_channel).pack(side="left", padx=6)
+        # ボタンを 2x2 で並べる。1 列に 4 個並べると 480px のウィンドウに
+        # 収まらず、停止ボタンが画面外へ押し出される（ユーザー指摘 2026-10-04）。
+        # 2x2 なら横幅 2 個分に収まる。
+        row = tk.Frame(root, bg=BG)
+        row.pack(pady=(0, 14))
+        btn_kw: dict = dict(width=10, font=f, relief="flat", bd=0, pady=10)
 
-        bot = tk.Frame(root, bg=BG)
-        bot.pack(pady=14)
+        # 1 行目: チャンネル選択
+        tk.Button(row, text="▲ CH", bg=BTN_BG, fg=FG,
+                  activebackground=BTN_ACTIVE, activeforeground=FG,
+                  command=self.prev_channel, **btn_kw).pack(side="left", padx=6)
+        tk.Button(row, text="▼ CH", bg=BTN_BG, fg=FG,
+                  activebackground=BTN_ACTIVE, activeforeground=FG,
+                  command=self.next_channel, **btn_kw).pack(side="left", padx=6)
+        # 2 行目: 再生 / 停止
+        row2 = tk.Frame(root, bg=BG)
+        row2.pack()
         self.btn_play = tk.Button(
-            bot, text="▶ 再生", width=12, font=f, bg="#2a4a2a", fg=OK,
+            row2, text="▶ 再生", bg="#2a4a2a", fg=OK,
             activebackground="#3a5a3a", activeforeground=OK,
-            relief="flat", bd=0, pady=8, command=self.play)
+            command=self.play, **btn_kw)
         self.btn_play.pack(side="left", padx=6)
-        tk.Button(bot, text="■ 停止", width=12, font=f, bg="#4a2a2a", fg=ERR,
+        tk.Button(row2, text="■ 停止", bg="#4a2a2a", fg=ERR,
                   activebackground="#5a3a3a", activeforeground=ERR,
-                  relief="flat", bd=0, pady=8,
-                  command=self.stop).pack(side="left", padx=6)
+                  command=self.stop, **btn_kw).pack(side="left", padx=6)
 
         self.lbl_log = tk.Label(root, text="", font=fs, bg=BG, fg=MUTED,
                                 anchor="w", justify="left")
@@ -275,7 +278,11 @@ class App:
 
     # ---------- 操作 ----------
     def _goto(self, i):
-        i = max(0, min(i, len(CHANNELS) - 1))
+        # 上限/下限に達したら反対側へ回り込む（循環）。
+        # クランプすると端で ▲ を押しても何も起きず、「壊れている」と
+        # 思われる（ユーザー指摘 2026-10-04）。
+        n = len(CHANNELS)
+        i %= n
         if i == self.index:
             return
         self.index = i

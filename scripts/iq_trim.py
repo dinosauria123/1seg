@@ -33,7 +33,19 @@ import time
 POLL_SEC = 10.0
 
 
-COLLAPSED_FILE = "/tmp/isdbt_collapsed"
+COLLAPSED_SUFFIX = ".collapsed"
+
+
+def collapsed_path_for(iq_path):
+    """IQ ファイルごとに累積値ファイルを分ける。
+
+    **これが必須**（実測 2026-10-04 12:43）:
+    `/tmp/isdbt_collapsed` を単一ファイルで共有していると、チャンネル切替
+    後に前のチャンネルの累積値が残る。stream_decode は pos=0 から
+    `SeekFrom::Current(-n)` を試みて EINVAL で失敗し、以後ずっと補正されない。
+    ファイルごとに分ければ他チャンネルの値 contaminate しない。
+    """
+    return iq_path + COLLAPSED_SUFFIX
 
 
 def log(path, msg):
@@ -44,7 +56,7 @@ def log(path, msg):
         pass
 
 
-def write_collapsed(total):
+def write_collapsed(path, total):
     """累積 collapse バイト数を原子的に書く。
 
     stream_decode は `--follow` 中にこのファイルを読む:
@@ -52,10 +64,10 @@ def write_collapsed(total):
       これをしないcollapse 後は reader が常に EOF を読む（実測 12:03）。
     """
     try:
-        tmp = COLLAPSED_FILE + ".tmp"
+        tmp = path + ".tmp"
         with open(tmp, "w") as fh:
             fh.write(str(total))
-        os.replace(tmp, COLLAPSED_FILE)
+        os.replace(tmp, path)
     except OSError:
         pass
 
@@ -106,8 +118,16 @@ def main():
     logf = sys.argv[3] if len(sys.argv) > 3 else "/tmp/isdbt_trim.log"
     max_collapse = keep // 4
     total = 0
+    cpath = collapsed_path_for(iq)
+    # 前回の累積を読み継ぐ（再起動時）。ファイルがないので 0 から。
+    try:
+        with open(cpath) as fh:
+            total = int(fh.read().strip() or "0")
+    except (OSError, ValueError):
+        total = 0
 
-    log(logf, f"=== iq_trim 開始: {iq} keep={keep} max_collapse={max_collapse} ===")
+    log(logf, f"=== iq_trim 開始: {iq} keep={keep} "
+              f"max_collapse={max_collapse} 累積={total} ===")
     while True:
         time.sleep(POLL_SEC)
         try:
@@ -153,7 +173,7 @@ def main():
 
         newsz = sz - n
         total += n
-        write_collapsed(total)
+        write_collapsed(cpath, total)
         log(logf, f"collapse {n} B 実行: {sz} → {newsz}  "
                   f"(pid={pid} pos={pos} 累積={total})")
 
