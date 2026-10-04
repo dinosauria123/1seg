@@ -1,4 +1,10 @@
-# oneseg-rs — 自作ワンセグ（ISDB-T 1seg）復調器
+# UbuntuでDS-DT308SVをワンセグ再生に使う
+
+https://github.com/Ryujiyasu/1seg.git
+のコードをFork元にして、UbuntuでDS-DT308SV（RTL2832U + FC0013）で1seg再生するコードです。
+Hermes Agent（space-bunny-alpha）にお任せで開発しています。
+
+以下引用と追記です。
 
 RTL-SDR ドングルで受けた IQ から、**ISDB-T のワンセグ（1セグメント）を自前で復調**する
 Rust プロジェクト。復調した MPEG-TS を **ffplay でそのまま再生**でき、
@@ -11,24 +17,13 @@ tkinter の **GUI 付き**でチャンネル切替・再生・停止ができる
 
 ---
 
-## なぜ自作か
+## 参考、流用した既存ソフトウェア
 
-- **フルセグ**（12 セグメント・帯域 約 5.6 MHz）は RTL-SDR の窓（約 2.4 MHz）に入りきらない
-  → 1 本のドングルでは受信不可。
-- **ワンセグ**（中央 1 セグメント・約 700 kHz 幅）なら窓に収まる。
-  しかも ISDB-T 1seg はスクランブルがかかっていないので、復号した TS をそのまま再生できる。
-- 既存の [`gr-isdbt`](https://github.com/git-artes/gr-isdbt) は GNU Radio 3.7〜3.8 + SWIG
-  世代のビルドに依存し、現代環境で動かすのが難しい。
+以下のコードを流用しています。
 
----
-
-## 参考にした既存ソフトウェア
-
-以下を**実装上の参照**として開発しました（コードの流用ではなく、
-仕様確認・段構成のリファレンスとして使っています）。
-
-| ソフトウェア | URL | ライセンス | 参考にした内容 |
+| ソフトウェア | URL | ライセンス | 参考、流用した内容 |
 |---|---|---|---|
+|**RTS_SDR — 自作ワンセグ（ISDB-T 1seg）復調器**|<https://github.com/Ryujiyasu/1seg.git>| GPL-3.0 | オリジナルのソース |
 | **gr-isdbt** | <https://github.com/git-artes/gr-isdbt> | GPL-3.0 | ISDB-T 固有の処理（TMCC デコード、PRBS エネルギー分散、リセット基準）。ISDB-T 圏で実際に運用されている数少ないオープンソース実装。 |
 | **DAB-Radio** | <https://github.com/williamyang98/DAB-Radio> | （upstream のものを参照） | GNU Radio に依存しない**単体実装**の手本。設計判断（ブロック分割、エラー処理、構成の簡潔さ）の参考にした。 |
 | **rtl-sdr** | <https://github.com/rtlsdr/rtl-sdr> | GPL-3.0 | `rtlsdr_set_bias_tee_gpio()` などの低レベル API の GPIO レジスタ定義。緑 LED の制御に使った。 |
@@ -120,15 +115,6 @@ cargo test -p isdbt-dsp
 
 ---
 
-## ブラウザ版（WASM + WebUSB）
-
-`crates/isdbt-wasm` を WebAssembly 化し、ブラウザ内で IQ → MPEG-TS を復号。
-Node でネイティブと同一の H.264 320x180 + AAC を検証済み。
-
-詳細: [`web/README.md`](web/README.md)（`wasm-pack build … --target web` → `python3 -m http.server`）
-
----
-
 ## セットアップ
 
 インストール手順・外部依存・カーネルモジュールの blacklist などは
@@ -185,12 +171,6 @@ C/N を確保するのはアンテナ／受信環境側の問題です。
 | [`docs/CONSTELLATION_SNR.md`](docs/CONSTELLATION_SNR.md) | 星座解析と C/N の関係 |
 | [`docs/DEGRADATION_INVESTIGATION.md`](docs/DEGRADATION_INVESTIGATION.md) | 復調劣化の調査記録 |
 | [`web/README.md`](web/README.md) | ブラウザ版のビルドと起動 |
-
----
-
-## 開発記（ブログ）
-
-- <https://yasu-home.com/rtl-sdr-v4-ubuntu-2604-setup/>（#0 環境構築）
 
 ---
 
