@@ -209,6 +209,11 @@ class App:
         self.watcher = LockWatcher(self.on_lock_line)
         self.watcher.start()
         self.refresh()
+        # 起動時に**実行中のチャンネル**へ表示を合わせる。
+        # 前回 GUI を閉じても受信プロセスが残っていると、保存された
+        # last_index と実際の受信チャンネルがずれる（実測 2026-10-04 15:1x）。
+        # このまま ▶ を押すと別チャンネルへ切り替わってしまう。
+        self.sync_to_running()
         self.root.after(400, self.poll_status)
 
     # ---------- 表示 ----------
@@ -222,6 +227,56 @@ class App:
 
     def playing(self):
         return alive("stream_decode") and alive("ffplay")
+
+    def running_freq(self):
+        """**実行中**の受信チャンネル周波数。停止中なら None。
+
+        `stream_decode` のコマンドラインから `isdbt_iq_<freq>.iq` を読む。
+        これがないと GUI は保存された `last_index` を表示するだけで、
+        **前回終了時に进程が残ったチャンネルと表示がずれる**（例: GUI は
+        ch13 を表示しているのに ch19 で受信中）。
+
+        実測 2026-10-04 15:1x: state file の last_index=0（ch13）だが
+        stream_decode は 509142857（ch19）で動作していた。
+        """
+        try:
+            out = subprocess.run(["pgrep", "-x", "stream_decode"],
+                                 capture_output=True, text=True).stdout.split()
+        except OSError:
+            return None
+        for pid in out:
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                    cmd = fh.read().replace(b"\0", b" ").decode("utf-8", "replace")
+            except OSError:
+                continue
+            m = re.search(r"isdbt_iq_(\d+)\.iq", cmd)
+            if m:
+                return int(m.group(1))
+        return None
+
+    def sync_to_running(self):
+        """実行中のチャンネルに GUI の選択を合わせる（起動時 1 回だけ）。
+
+        状態が食い違っていると「▶ 再生」で**別チャンネルに切り替わって**しまい、
+        ユーザーが意図しない再起動になる。具体的には:
+          - GUI が ch13 を表示しているのに ch19 で受信中
+          - ユーザーが ▶ を押すと ch13 に切り替えて再起動する
+        """
+        if not self.playing():
+            return
+        freq = self.running_freq()
+        if freq is None:
+            return
+        for i, (_ch, f, _p, _s, _r) in enumerate(CHANNELS):
+            if f == freq:
+                if i != self.index:
+                    self.index = i
+                    self.refresh()
+                return
+        # CHANNELS にない周波数（チャンネルリストを編集した後など）。
+        # 表示はそのままに、ログでだけ知らせる。
+        self.lbl_log.config(text=f"受信中 {freq/1e6:.3f} MHz（一覧になし）", fg=WARN)
 
     def poll_status(self):
         if self.playing():

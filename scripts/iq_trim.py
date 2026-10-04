@@ -30,7 +30,22 @@ import subprocess
 import sys
 import time
 
-POLL_SEC = 10.0
+# **POLL_SEC は 0.5 でなければならない**（実測 2026-10-04 15:10 の事故）:
+#
+#   rtl_sdr の追記速度      2,097,152 B/s（実時間、IQ_KEEP に関係なく一定）
+#   10 秒に 1 回の collapse  999,834 B/s
+#   → 差 +1,097,318 B/s。ファイルが毎秒 1 MB 増え続ける。
+#
+#   結果: 約45 分で 5.6 GB に達した（`captures/live/isdbt_iq_473142857.iq`）。
+#   ディスク 233G を使い切る恐れがあった。
+#
+# 0.5 秒なら 2 MB/s 回収できる。`max_collapse`（= keep/4 = 10 MB）が
+# 1 回の上限なので、0.5 秒ごとに 10 MB 潰せる = 20 MB/s の能力があり、
+# 追記速度の 10 倍の余裕がある。
+#
+# ただし `fallocate --collapse-range` はファイルシステムの inode を更新する
+# ので、呼びすぎると性能が出る。0.5 秒なら安全。
+POLL_SEC = 0.5
 
 
 COLLAPSED_SUFFIX = ".collapsed"
@@ -116,6 +131,14 @@ def main():
     iq = sys.argv[1]
     keep = int(sys.argv[2])
     logf = sys.argv[3] if len(sys.argv) > 3 else "/tmp/isdbt_trim.log"
+    # 1 回の潰す量の上限。`keep // 4` = 10 MB。
+    #
+    # 潰す量と頻度の関係（追記速度 2,097,152 B/s を上回る必要がある）:
+    #     10 MB / 0.5 s = 20 MB/s  → 余裕あり
+    #     10 MB / 10 s  = 1 MB/s   → **不足**（これが事故の原因）
+    #
+    # 1 回の潰す量が大きいほど GOP を飛ばす危険が増えるので
+    # `keep // 4` を維持し、頻度で必要量を確保する。
     max_collapse = keep // 4
     total = 0
     cpath = collapsed_path_for(iq)
