@@ -2573,6 +2573,16 @@ impl StreamingDecoder {
             .unwrap_or((0, 0, 0, 0))
     }
 
+    /// 注入した discontinuity パケット数（診断用）。
+    ///
+    /// OPERATION.md §8.5: 訂正不能が `BURST_THRESHOLD`(32) 個以上連続すると
+    /// demux に「ここから状態を破棄せよ」と伝える PCR パケットを挿入する。
+    /// この件数が 0 のまま H.264 が崩れるなら、原因は「局所的な連続訂正不能」
+    /// ではなく「訂正『成功』ブロック内の散発的 bit error」と特定できる。
+    pub fn disc_count(&self) -> u64 {
+        self.disc_count
+    }
+
     /// DC オフセットの追従率（0 で追従しない = 旧挙動）。
     ///
     /// 実測 2026-09-26: `self.dc` は `try_lock()` で**一度だけ**推定され、

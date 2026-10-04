@@ -21,6 +21,7 @@ set -uo pipefail
 
 self=$$
 parent=$PPID
+freed=0
 
 # --- 1) 名前ベース（pgrep -x は完全一致なので自分Perc にマッチしない）---
 for name in vlc ffplay stream_decode rtl_sdr; do
@@ -45,7 +46,7 @@ if [ -f "$PIDF" ]; then
       *python*)
         cmd=$(tr '\0' ' ' < "/proc/$lp/cmdline" 2>/dev/null || true)
         case "$cmd" in
-          *lock_watch.py*|*ts_http_server.py*)
+          *lock_watch.py*|*ts_http_server.py*|*iq_trim.py*)
             kill -9 "$lp" 2>/dev/null
             ;;
           *)
@@ -56,6 +57,39 @@ if [ -f "$PIDF" ]; then
     esac
   done < "$PIDF"
   rm -f "$PIDF"
+fi
+
+# --- 3) IQ キャプチャの逐次削除 ---
+#
+# 为什么要删（実測 2026-10-04 11:15「NHK総合とHBCが映らない」）：
+#   /tmp は tmpfs 3.6G しかない。7 チャンネルの IQ を 400 MB ずつ取ると
+#   2.9G を使い切り、`echo: write error: ディスク使用量制限を超過しました` で
+#   **起動スクリプトの 113 行目（ALIVE ファイル書き込み）が失敗する**。
+#   その結果 stream_decode はライターハンドラを見失って停止し、
+#   ffplay には空の FIFO が渡るだけになる = ウィンドウは出るが真っ黒。
+#   実害は「再生不出来」であり、IQ の残量ではない。
+#
+# 必要な IQ 量は 10 MB（5.1 秒）だけ（stream.rs need_init）。ファイルは
+# `--follow` が末尾から逐次読むので、**保持量はロックに影響しない**。
+# 従って停止時に全消しで問題ない。
+#
+# 消さないもの: /tmp/isdbt_segoff_*（bin offset の実測値。消すと毎回探索する）
+#
+# IQ は 2026-10-04 から ext4 上（~/oneseg-rs/captures/live/）に置く。
+# `/tmp` のままだと tmpfs で `fallocate --collapse-range` が使えないので
+# iq_trim.py の容量制限が効かず、IQ が 400 MB を超えていた。
+IQDIR="${IQDIR:-$HOME/oneseg-rs/captures/live}"
+for f in "$IQDIR"/isdbt_iq_*.iq /tmp/isdbt_iq_*.iq; do
+  [ -f "$f" ] || continue
+  sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
+  rm -f "$f"
+  freed=$((freed + sz))
+done
+for f in /tmp/isdbt_ts_*.fifo; do
+  [ -e "$f" ] && rm -f "$f"
+done
+if [ "${freed:-0}" -gt 0 ]; then
+  echo "IQ キャプチャ削除: $((freed / 1048576)) MB 回収"
 fi
 
 sleep 1

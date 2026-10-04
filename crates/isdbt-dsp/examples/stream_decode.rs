@@ -121,10 +121,37 @@ fn main() {
         }
     }
 
-    let mut reader: Box<dyn Read> = if inpath == "-" {
-        Box::new(std::io::stdin().lock())
+    // `--follow` で IQ ファイルを読むとき、外部のトリマー（iq_trim.py）が
+    // `fallocate --collapse-range` で**ファイル先頭を潰す**ことがある。
+    // collapse は inode を保ったまま内容を左へ詰めるので、ファイル上の
+    // オフセットは変わらないまま**内容だけ n バイト分ずれる**。
+    //
+    // 放置すると reader が「すでに消えた領域」を読み続ける（= 復調が壊れる）。
+    // トリマーは `/tmp/isdbt_collapsed` に累積 collapse バイト数を書き、
+    // ここでは 250ms ごとにそれを読んで**オフセットを補正**する。
+    //
+    // 補正は `SeekFrom::Current(-delta)`。累積値なので差分だけ戻す。
+    // 復調器の状態（等化器・Viterbi・PRBS 位相）はそのままよい。再取得
+    //（stream.rs REACQUIRE_EVERY=800 シンボル）が自力で境界を取り直す。
+    //
+    // **File は 1 つだけ開く**。2 つ開くと `iq_trim.py` が `/proc/*/fd` を
+    // 走査して pos を読む際に、どちらの pos を使うか分からなくなる
+    // （実測 2026-10-04 12:07: fd 3 と fd 4 が同じファイルを指し、fdinfo/3 の
+    // pos は 0 のまま → stream_decode が 1 バイトも読まない）。
+    let mut input_file: Option<fs::File> = if inpath == "-" {
+        None
     } else {
-        Box::new(fs::File::open(&inpath).expect("in"))
+        Some(fs::File::open(&inpath).expect("in"))
+    };
+    let collapsed_path = std::env::var("ISDBT_COLLAPSED").unwrap_or_else(|_| {
+        "/tmp/isdbt_collapsed".to_string()
+    });
+    let mut collapsed_seen: u64 = 0;
+    let use_file = input_file.is_some();
+    let stdin_lock = if use_file { None } else { Some(std::io::stdin().lock()) };
+    let mut reader: Box<dyn Read> = match stdin_lock {
+        Some(l) => Box::new(l),
+        None => Box::new(std::io::empty()),
     };
     let mut out: Box<dyn Write> = if outpath == "-" {
         Box::new(std::io::stdout().lock())
@@ -145,9 +172,48 @@ fn main() {
     let mut started = false;
     let mut announced = false;
     loop {
-        // ファイル入力 + --follow なら、書き手が居る間は EOF でも終了しない。
-        // `writer_alive` は別の monitor が 0/1 で書き込むファイル。
-        let n = match reader.read(&mut raw) {
+        // 外部トリマーの collapse 通知を監視し、ファイルオフセットを補正する。
+        //
+        // `fallocate --collapse-range --offset 0 --length n` は [0, n) を消して
+        // 残りを左へ詰める。ファイル上のオフセットは変わらないので、reader は
+        // 「すでに消えた n バイト」を読み続ける。ここで `pos -= n` 補正する。
+        //
+        // 補正しない場合の実害（実測 2026-10-04 12:03）:
+        //   collapse 後に pos が sz を超えると reader は常に EOF を読む。
+        //   `--follow` は writer_alive なら終了しないので**無言で空振り**し、
+        //   TS が 1 バイトも出力されなくなる。
+        if follow && input_file.is_some() {
+            if let Ok(txt) = fs::read_to_string(&collapsed_path) {
+                if let Ok(total) = txt.trim().parse::<u64>() {
+                    if total > collapsed_seen {
+                        let delta = total - collapsed_seen;
+                        collapsed_seen = total;
+                        use std::io::Seek;
+                        if let Some(f) = input_file.as_mut() {
+                            // 補正できない（既にファイル末尾を越えた）場合は
+                            // ログに残す。reader は EOF 読みで空振りになるので、
+                            // 復調器の再取得（800 シンボル周期）に賭けるしかない。
+                            let newpos = f.stream_position().unwrap_or(0);
+                            let se = f.seek(std::io::SeekFrom::Current(-(delta as i64)));
+                            eprintln!(
+                                "[collapse] 累積={collapsed_seen}B 補正=-{delta}B \
+                                 pos {newpos} → {} ({:?})",
+                                newpos.saturating_sub(delta),
+                                se.err()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let n = match if use_file {
+            match input_file.as_mut().unwrap().read(&mut raw) {
+                Ok(v) => Ok(v),
+                Err(e) => Err(e),
+            }
+        } else {
+            reader.read(&mut raw)
+        } {
             Ok(0) | Err(_) => {
                 if !follow {
                     break;
@@ -203,8 +269,9 @@ fn main() {
                 let tail: Vec<(usize, usize)> = v.iter().rev().take(4).rev().copied().collect();
                 tail.iter().map(|(b, p)| format!("{b}:{p}")).collect::<Vec<_>>().join(",")
             };
+            let dc = dec.disc_count();
             eprintln!(
-                "[dbg] in={n}B out={}B locked={} backlog={}sym 訂正blk={rc} 訂正bit={rb} 総blk={seen} drop={drop} mis={mis} symerr={se} symerr/blk={spb:.2} fail={fr:?} depu={dp:?} soft={sf:.4} h={havg:.2} m4={m4u}/{m4a} sync={sy}/{syc} vspread={vsp:.2} vfin={vfin} vq={vq}",
+                "[dbg] in={n}B out={}B locked={} backlog={}sym 訂正blk={rc} 訂正bit={rb} 総blk={seen} drop={drop} mis={mis} symerr={se} symerr/blk={spb:.2} fail={fr:?} depu={dp:?} soft={sf:.4} h={havg:.2} m4={m4u}/{m4a} sync={sy}/{syc} vspread={vsp:.2} vfin={vfin} vq={vq} disc={dc}",
                 ts.len(),
                 dec.is_locked(),
                 dec.backlog_syms(),

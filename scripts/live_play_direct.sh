@@ -83,9 +83,29 @@ rm -f "$IQFIFO" "$ALIVE"
 # 検証: ch19 単独で IQ を取り直すと RS 0.926 / PTS 差 -0.009 秒で正常。
 #       チャンネルの TS はハッシュが全部違う（f0a5/eb36/b3c5…）ので
 #       復調自体は正しく、経路の残留だけが問題だった。
-IQFILE="/tmp/isdbt_iq_${FREQ}.iq"
+# IQ は **tmpfs ではなく ext4 上に置く**。
+#
+# 実測 2026-10-04: `/tmp` は tmpfs 3.6G で `fallocate --collapse-range` が
+# 「サポートされていない操作です」で失敗する。 Résultat IQ は 2 分で 400 MB
+# を超えて iq_trim.py が何もできず、再実験の邪魔になっていた。
+# ext4 なら collapse が効くので、iq_trim.py の容量制限が機能する。
+#
+# FIFO（isdbt_iq.fifo / isdbt_ts_*.fifo）は速度 때문에 tmpfs のまま。
+IQDIR="${IQDIR:-$HOME/oneseg-rs/captures/live}"
+mkdir -p "$IQDIR"
+IQFILE="$IQDIR/isdbt_iq_${FREQ}.iq"
 TSFIFO="/tmp/isdbt_ts_${FREQ}.fifo"
-IQ_KEEP="${IQ_KEEP:-400000000}"
+# ext4 上なので collapse が効く（実測 2026-10-04）。
+# 保持量は 40 MB（実時間 約20 秒）。理論必要量は 10 MB（5.1 秒、
+# stream.rs の need_init = (LOCK_SYMS+8)*1280+60000）なので余裕は4倍。
+#
+# 400 MB があった实事（2026-10-04 11:15「映らない」）：
+#   /tmp は tmpfs 3.6G。7 チャンネル × 400 MB = 2.9G で上限に逼近し、
+#   本スクリプトの `echo -n 1 > "$ALIVE"` が write error で失敗した。
+#   その結果 stream_decode がライターハンドラを見失って止まり、
+#   ffplay には空の TS FIFO が渡るだけ（ウィンドウは出るが真っ黒）。
+# 保持量を減らせば、IQ は末尾から逐次読まれるのでロックには影響しない。
+IQ_KEEP="${IQ_KEEP:-40000000}"
 if [ -f "$IQFILE" ]; then
   sz=$(stat -c%s "$IQFILE" 2>/dev/null || echo 0)
   if [ "$sz" -gt "$IQ_KEEP" ]; then
@@ -105,7 +125,25 @@ mkfifo "$IQFIFO"; mkfifo "$TSFIFO"
 #    IQFILE を追従して読むので、生 IQ はここで溜め込む。
 #    append (`>>`) で開く。`: > "$IQFILE"` で truncate しないこと。
 ( exec 3>>"$IQFILE"; cat "$IQFIFO" >&3 ) >/dev/null 2>&1 &
+WRITER_PID=$!
 sleep 1
+
+# 1b) IQ トリマー（バックグラウンド）。
+#
+# 上の `IQ_KEEP` チェックは**起動時の 1 回だけ**評価されるので、実行中は
+# rtl_sdr の追記（実時間 2 MB/s）で際限なく膨らむ（実測: 2 分で 395 MB）。
+# `/tmp` は tmpfs 3.6G なので 7 チャンネル走ると `echo -n 1 > "$ALIVE"` が
+# write error で失敗し、再生が止まる（実測 2026-10-04 11:15）。
+#
+# `tail -c > new && mv` は不可（writer の fd 3 が旧 inode を指すままになる）。
+# そのため iq_trim.py が `fallocate --collapse-range` で**読了済みの範囲だけ**
+# を頭から潰す（inode を保ち、末尾をずらすので fd 3 は有効）。
+TRIM_LOG=/tmp/isdbt_trim.log
+: > "$TRIM_LOG"
+nohup /usr/bin/python3 "$HOME/oneseg-rs/scripts/iq_trim.py" \
+  "$IQFILE" "$IQ_KEEP" "$TRIM_LOG" >/dev/null 2>&1 &
+TRIM_PID=$!
+echo "$TRIM_PID" >> "$PIDF"
 
 # 2) rtl_sdr を起動
 rtl_sdr -f "$FREQ" -s 1015873 -g "$GAIN" "$IQFIFO" >>"$LOG" 2>&1 &
