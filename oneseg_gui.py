@@ -45,7 +45,12 @@ from tkinter import font as tkfont
 from tkinter import ttk
 
 HOME = os.path.expanduser("~")
-REPO = os.path.join(HOME, "oneseg-rs")
+# リポジトリ位置はスクリプト自身の場所から求める（$HOME/oneseg-rs 固定に
+# しない）。別ディレクトリに clone して実行しても channels.csv と
+# scripts/ が見つかる。
+REPO = os.path.dirname(os.path.abspath(__file__))
+# 環境変数で上書きできる（開発時に別ツリーを向かせたい場合）
+REPO = os.environ.get("ONESEG_REPO", REPO)
 LIVE_SH = os.path.join(REPO, "scripts", "live_play_direct.sh")
 STOP_SH = os.path.join(REPO, "scripts", "stop_live.sh")
 SEGOFF_FILE = "/tmp/isdbt_segoff"
@@ -54,16 +59,63 @@ STATE_FILE = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")),
     "oneseg-rs", "gui_state.json")
 
-# 札幌（手稲山）親局。ch, 中心周波数 Hz, 実測電力, 局名, リモコン番号
-CHANNELS = [
-    (13, 473_142_857,  1.6, "NHK教育", 2),
-    (14, 479_142_857, 75.7, "TVh", 7),
-    (15, 485_142_857, 72.9, "NHK総合", 3),
-    (19, 509_142_857, 76.4, "HBC", 1),
-    (21, 521_142_857, 65.1, "STV", 5),
-    (23, 533_142_857, 64.2, "HTB", 6),
-    (25, 545_142_857, 89.3, "UHB", 8),
-]
+# チャンネル設定は channels.csv から読む（地域ごとに編集する）。
+# 戻り値は従来と同じ 5-tuple: (ch, freq_hz, power, station, remote)
+CHANNELS_CSV = os.path.join(REPO, "channels.csv")
+
+
+def load_channels(path=CHANNELS_CSV):
+    """channels.csv を読み込んでチャンネルリストを返す。
+
+    形式はINSTALL.md / channels.csv のヘッダを参照。`#` コメントと空行は
+    無視する。1 行でも不正があれば、その場で例外を送出して静かに脱落するのを
+    避ける（チャンネルが 1 つ減ったままでも起動してしまうため）。
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = f.read()
+    except OSError as e:
+        raise SystemExit(f"チャンネル設定が読めません: {path} ({e})")
+
+    out = []
+    for lineno, line in enumerate(raw.splitlines(), 1):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        # ヘッダ行（列名）は読み飛ばす
+        if s.split(",")[0].strip().lower() in ("ch", "チャンネル"):
+            continue
+        parts = [p.strip() for p in s.split(",")]
+        if len(parts) != 5:
+            raise SystemExit(
+                f"{path}:{lineno}: 列数が {len(parts)} 個（5 個必要）: {line!r}")
+        # Python の int() は桁区切りのアンダースコアを受け付けるので、
+        # CSV では許容せず ASCII 数字のみに限定する。
+        if not parts[1].isdigit():
+            raise SystemExit(
+                f"{path}:{lineno}: 周波数は桁区切りなしの数字で記述 "
+                f"（例: 485142857）: {line!r}")
+        try:
+            ch = int(parts[0])
+            freq = int(parts[1])
+            power = float(parts[2])
+            remote = int(parts[4])
+        except ValueError as e:
+            raise SystemExit(f"{path}:{lineno}: 数値の解釈に失敗 ({e}): {line!r}")
+        if freq <= 0:
+            raise SystemExit(f"{path}:{lineno}: 周波数が 0 以下: {line!r}")
+        out.append((ch, freq, power, parts[3], remote))
+
+    if not out:
+        raise SystemExit(f"チャンネル設定が空です: {path}")
+    freqs = [c[1] for c in out]
+    if len(set(freqs)) != len(freqs):
+        dup = sorted({f for f in freqs if freqs.count(f) > 1})
+        raise SystemExit(f"{path}: 周波数が重複しています: {dup}")
+    return out
+
+
+CHANNELS = load_channels()
 
 BG = "#1e1e26"
 FG = "#e6e6ef"

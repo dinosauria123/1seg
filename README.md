@@ -154,7 +154,7 @@ C/N を確保するのはアンテナ／受信環境側の問題です。
 | bin offset | チャンネルごとに違う（1 bin = 992 Hz）。`/tmp/isdbt_segoff_<freq>` に保存 |
 | 保持量 | `/tmp` は tmpfs 3.6G。IQ は `captures/live/`（ext4）に置くのが安全 |
 | H.264 MB エラー | 訂正不能 0.7% の散発に由来。`discontinuity_indicator` では完全には防げない |
-| 地域 | 札幌（手稲山親局）のチャンネル一覧をハードコード。他の地域では変更が必要 |
+| 地域 | `channels.csv` を編集する（現在は札幌・手稲山親局のチャンネルを収録） |
 
 ---
 

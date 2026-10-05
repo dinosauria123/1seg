@@ -162,8 +162,7 @@ ffmpeg -ss 6 -i /tmp/out.ts -frames:v 1 /tmp/frame.png
 - **▶ 再生** または **Space**: 再生開始
 - **■ 停止** または **Esc**: 停止
 - 映像は ffplay のウィンドウで表示（GUI 内蔵ではない）
-
-チャンネル一覧（札幌・手稲山親局）:
+**チャンネル一覧は `channels.csv` で定義する**（現在は札幌・手稲山親局）。GUI はここを読み込む。地域ごとに編集する。
 
 | ch | 周波数 MHz | 局名 | リモコン |
 |---|---|---|---|
@@ -256,6 +255,7 @@ IQDIR=~/captures ~/oneseg-rs/scripts/live_play_direct.sh 509142857
 │   │   │   └── stream.rs    # ストリーミング復調器
 │   │   └── examples/        # 診断・復号ツール
 ├── oneseg_gui.py          # tkinter GUI
+├── channels.csv           # チャンネル一覧（GUI が読む。地域ごとに編集）
 ├── scripts/
 │   ├── live_play_direct.sh  # ライブ再生（GUI が呼ぶ実体）
 │   ├── stop_live.sh         # 停止・IQ 削除・LED 消灯
