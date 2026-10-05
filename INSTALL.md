@@ -3,6 +3,14 @@
 自作 ISDB-T 1seg（ワンセグ）復調器 `~/oneseg-rs` のセットアップ手順。
 検証環境: **Ubuntu 26.04.1 LTS / x86_64 / rtl-sdr 2.0.2 / Rust 1.93 / FFmpeg 9.0.1**
 
+> **短縮手順**: 以下の §1〜§4 は `./install.sh` が自動実行します。
+> ```bash
+> git clone https://github.com/dinosauria123/1seg.git ~/oneseg-rs
+> cd ~/oneseg-rs
+> ./install.sh          # --dry-run / --no-apt / --no-verify が使える
+> ```
+> 以降の章は手順の詳細とトラブルシューティングとして参照してください。
+
 ---
 
 ## 1. 必要なもの

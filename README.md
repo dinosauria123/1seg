@@ -15,6 +15,18 @@ tkinter の **GUI 付き**でチャンネル切替・再生・停止ができる
 - **GUI で 7 チャンネル切替**（札幌・手稲山親局）
 - **緑 LED の GPIO 点灯**（ドングルの稼働表示）
 
+## 導入
+
+```bash
+git clone https://github.com/dinosauria123/1seg.git ~/oneseg-rs
+cd ~/oneseg-rs
+./install.sh              # 依存導入 → blacklist → release ビルド → 動作確認
+./oneseg_gui.py           # GUI を起動
+```
+
+`install.sh --dry-run` で変更せずに何をするか確認できます。
+手順の詳細とトラブルシューティングは [INSTALL.md](INSTALL.md)。
+
 ---
 
 ## 参考、流用した既存ソフトウェア
