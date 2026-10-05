@@ -123,7 +123,7 @@ impl SpGridAccumulator {
         for (i, &m) in [0usize, 3, 6, 9].iter().enumerate() {
             let mut acc = Complex32::new(0.0, 0.0);
             let mut n = 0u32;
-            for k in (0..SEGMENT_CARRIERS) {
+            for k in 0..SEGMENT_CARRIERS {
                 if k % SP_SPACING == m && self.acc[k].1 > 0 {
                     acc += self.acc[k].0 / self.acc[k].1 as f32;
                     n += 1;
@@ -334,12 +334,14 @@ pub fn sp_timing_offset_2d_diag(
 
 /// SP 位置 `a` と `b` の `H_hat(a)·conj(H_hat(b))` を返す。
 /// 振幅が小さすぎる場合は `None`。
+#[allow(dead_code)] // 診断用の未被呼び出しヘルパ
 fn sp_pair(seg: &[Complex32], a: usize, b: usize, pilots: &SegmentPilots) -> Option<Complex32> {
     let (ha, hb) = (h_hat(seg, a, pilots)?, h_hat(seg, b, pilots)?);
     Some(ha * hb.conj())
 }
 
 /// 別シンボルの SP 位置 `a`（`seg_a` 側）と `b`（`seg_b` 側）の相関。
+#[allow(dead_code)] // 診断用の未被呼び出しヘルパ
 fn sp_pair_across(
     seg_a: &[Complex32],
     seg_b: &[Complex32],

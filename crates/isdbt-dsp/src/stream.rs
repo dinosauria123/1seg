@@ -141,6 +141,7 @@ const DUMP_RING: usize = 8192;
 ///
 /// 204 バイト = 1632 情報ビット、レート 2/3 なので 1728 トレリスステップ、
 /// 1 ステップ 2 値（X, Y）で **3456 値**。余裕をみて少し多めに取る。
+#[allow(dead_code)] // 未使用。soft リング長の派生値を記録（実装は Pipe 側）
 const RS_BLOCK_SOFT: usize = 3456;
 
 /// 保持する**トレリスステップ数**。
@@ -207,6 +208,7 @@ const SEGOFF_RETRY_DEFAULT: usize = 2;
 ///
 /// `ISDBT_COMPACT=0` で無効化できる（メモリは `[buf.len()]` に比例して増える
 /// が、80MB IQ なら 40MB 程度）。
+#[allow(dead_code)] // 未使用。docs/DEGRADATION_INVESTIGATION.md §4 の実測根拠として残す
 fn compact_at() -> usize {
     let v = match std::env::var("ISDBT_COMPACT") {
         Ok(v) => v.parse().unwrap_or(COMPACT_AT),
@@ -792,7 +794,7 @@ fn demod_and_align(
     phase0_in: usize,
 ) -> Option<(f32, usize, usize, usize)> {
     let pilots = SegmentPilots::center_1seg();
-    let mut phase_rows: Vec<[f32; 4]> = specs
+    let phase_rows: Vec<[f32; 4]> = specs
         .iter()
         .map(|sp| phase_scores_gr_isdbt(&sp[seg_off..seg_off + 432], &pilots))
         .collect();
@@ -940,6 +942,9 @@ fn lock_params(specs: &[Vec<Complex32>], phase0: usize, seg_off: usize) -> Optio
 }
 
 /// 逐次パイプライン状態（1シンボル→ TSパケット）。warmup 中は状態だけ進め出力破棄。
+// 診断用のダンプ/カウンタは復調本体では読まれないが、
+// ISDBT_ATOM / ISDBT_DUMP の診断モードが使うため残す。
+#[allow(dead_code)]
 struct Pipe {
     pilots: SegmentPilots,
     tdi: TimeDeinterleaver,
@@ -1087,7 +1092,7 @@ struct Pipe {
     pub dbg_prof_n: u64,
     /// 診断: 追跡キャリアの**補間後** `|h[l]|^2` 窓平均（等化器が見る値）。
     pub dbg_trk_h: [f64; 6],
-    /// 診断: SP 帯域像。`SP_LS[l]` の `|seg[l]|^2` を**累積**（窓切���し）。
+    /// 診断: SP 帯域像。`SP_LS[l]` の `|seg[l]|^2` を**累積**（窓切りし）。
     ///
     /// 周波数選択性フェージングなら、この帯域像全体が「うねる」。
     /// 1 本だけ孤立して動くなら `l=204` 固有の問題。
@@ -2246,7 +2251,7 @@ impl Pipe {
                 let n_v = self.rs_byte_vitpos.len();
                 if n_v >= rs::N {
                     let v_lo_abs = self.rs_byte_vitpos[n_v - rs::N];
-                    let ring = self.dump_vit.len() as u64;
+                    let _ring = self.dump_vit.len() as u64;
                     // リングは「現在位置まで」のみ保持。v_lo_abs が
                     // リング外なら、そのブロックは保持範囲より古い。
                     if v_lo_abs + (rs::N * 8) as u64 >= self.vit_bits_out {

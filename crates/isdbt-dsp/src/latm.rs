@@ -98,7 +98,7 @@ impl LatmConfig {
     /// Returns the number of program layers after the fixed header.
     pub fn parse_strict(bytes: &[u8]) -> Option<Self> {
         let mut r = BitReader::new(bytes);
-        let audio_mux_version = r.read_bits(1)? as u8;
+        let _audio_mux_version = r.read_bits(1)? as u8;
         let all_streams_same_time_framing = r.read_bits(1)? != 0;
         let num_sub_frames = r.read_bits(6)? as u8;
         let num_programs = r.read_bits(4)? as u8;
@@ -106,7 +106,7 @@ impl LatmConfig {
         let programs = Self::parse_program_layers(&mut r, num_programs, all_streams_same_time_framing)?;
         let first = *programs.first()?;
         let _ = first;
-        let mut probe = BitReader::new(bytes);
+        let probe = BitReader::new(bytes);
         let cfg = Self::parse(probe)?;
         Some(cfg)
     }
