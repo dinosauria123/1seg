@@ -6,7 +6,7 @@ Hermes Agent（space-bunny-alpha）にお任せで開発しています。
 
 以下引用と追記です。
 
-RTL-SDR ドングルで受けた IQ から、**ISDB-T のワンセグ（1セグメント）を自前で復調**する
+Zox製 DS-DT308SV USBドングルで受けた IQ から、**ISDB-T のワンセグ（1セグメント）を自前で復調**する
 Rust プロジェクト。復調した MPEG-TS を **ffplay でそのまま再生**でき、
 tkinter の **GUI 付き**でチャンネル切替・再生・停止ができる。
 
