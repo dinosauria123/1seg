@@ -55,7 +55,7 @@ git clone --depth 1 https://github.com/git-artes/gr-isdbt.git ref/gr-isdbt
 git clone --depth 1 https://github.com/williamyang98/DAB-Radio.git ref/DAB-Radio
 ```
 
-> 参照実装には ISDB-T 圏（ブラジル・日本）で使用されているiha软件が含まれます。
+> 参照実装には ISDB-T 圏（ブラジル・日本）で使用されているオープンソースソフトウェアが含まれます。
 > 本プロジェクトは **合法な地上デジタル放送の受信**（自分の地域で受信できる放送）を
 > 対象としており、復調そのものは暗号解読を含みません。
 

@@ -54,7 +54,7 @@ ONESEG = True
 # 重要: grc の実チェーンは
 #   ofdm_synchronization -> tmcc_decoder -> frequency_deinterleaver
 # で、**TMCC デコーダが同期と 周波数デインターリーブの間に入る**。
-# TMCC から得た pilot 位相・星座サイズ・区切り位置が 周波数デイン Kathryn に
+# TMCC から得た pilot 位相・星座サイズ・区切り位置が 周波数デインタ に
 # 渡る。我々の実装に無い部品であり、眾の Pilot 位相取得に相当する。
 sync  = isdbt.ofdm_synchronization(MODE, CP, False)
 tmcc  = isdbt.tmcc_decoder(MODE, True)

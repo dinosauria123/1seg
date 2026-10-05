@@ -223,7 +223,7 @@ def pump():
     # ContinuityTracker と同じ役目。これが無いと chunk 境界で CC がずれる。
     cc_state = {}
     # FIFO を non-blocking にして、要求サイズ分が揃うまで待たないようにする。
-    # 阻塞读的状態で `anon_pipe_read` に張り付き.Send-Q=0、VLC は 0:00 のまま
+    # ブロック読みの状態で `anon_pipe_read` に張り付き.Send-Q=0、VLC は 0:00 のまま
     # だった（実測 2026-09-26）。
     import os as _os
     import fcntl as _fcntl

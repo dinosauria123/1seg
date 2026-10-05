@@ -8,7 +8,7 @@
 必ず |syms| >= 1 のジャンプを導入する。
 
 このスクリプトは `[k]` 行（境界補正のたびに ISDBT_DEBUG で出力される）を
-解析し、blk 位置・Δ・syms の相関と「却下asty ジャンプが起きた回数」を出す。
+解析し、blk 位置・Δ・syms の相関と「却下ジャンプが起きた回数」を出す。
 """
 import subprocess, os, re, sys, collections
 

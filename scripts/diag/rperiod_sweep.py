@@ -7,7 +7,7 @@
       実装の kept bit 数 204×384×2×3/4 = 117,504 が 64 ブロック分
       (96,256) と一致しない点が矛盾。
 
-判定: 長い capture で drop/総blk が周期无关に低ければその周期が正解。
+判定: 長い capture で drop/総blk が周期 無関係に低ければその周期が正解。
 """
 import os, re, subprocess, sys
 

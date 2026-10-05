@@ -8,7 +8,7 @@ bin offset はチャンネルごとに違う（1 bin = 992 Hz の量子化で、
 
 使い方:
   python3 scripts/diag/seg_offset_survey.py
-  # 出力する SEGOFF を /tmp/isdbt_segoff_<freq>.iq ogos に保存する。
+  # 出力する SEGOFF を /tmp/isdbt_segoff_<freq>.iq などに保存する。
 """
 import os
 import re

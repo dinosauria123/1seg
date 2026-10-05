@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PID ごとに transport_scrambling_control を集計する。
 
-全パNICをまとめて数えると、null/PSI パケットが 0 であるために
+全パケットをまとめて数えると、null/PSI パケットが 0 であるために
 「暗号化率」が看似iously高く出る。映像 PID に限定して見る必要がある。
 
 さらに、スクランブル化が『連続区間』か『散発』かも見る:

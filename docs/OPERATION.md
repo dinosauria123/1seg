@@ -140,7 +140,7 @@ bin offset 41通りを総当たりしても 70% が天井で、信号そのも�
   EOF させる。
 - **低ゲイン群 `lowgain/` だけが 100% ロックした記録がある一方、同条件の
   `gain-test/`・`scan/` は全て偽ロック。ゲイン方向の差は ADC 飽和で説明できる。
-- ログ上の "ロック→ライブ復码開始" は **`is_true_lock()` を通ってから出すこと**。
+- ログ上の "ロック→ライブ復調開始" は **`is_true_lock()` を通ってから出すこと**。
 
 ## 7. 診断ツール一覧（`examples/`）
 
@@ -172,7 +172,7 @@ bin offset 41通りを総当たりしても 70% が天井で、信号そのも�
   出力のみ残る。
 - **保存した TS が再生できない問題（2026-09-26 解決済み）**。原因は字幕 PID
   0x0587 の PES ヘッダ長。下記 §8.2 参照。
-- `stream_decode` のログが「ロック→ライブ復码開始」を出しても、Wayland 上の
+- `stream_decode` のログが「ロック→ライブ復調開始」を出しても、Wayland 上の
   ffplay ウィンドウが出ないことがある。SDL/Xwayland の問題であり復調とは無関係。
 - 音声 PES は HE-AAC / LATM で、PES header / CC は正常。ffplay 側で
   `channel element 3.1 is not allocated` 警告が出るが音は出る。

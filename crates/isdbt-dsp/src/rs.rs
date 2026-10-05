@@ -132,10 +132,10 @@ pub fn syndrome_weight(block: &[u8]) -> usize {
 
 /// 復号失敗の理由（診断用）。
 ///
-/// `syndrome_weight` は `[u8; 16]` の非ゼロ要素**数**なのでCorrections 上限 16 で
+/// `syndrome_weight` は `[u8; 16]` の非ゼロ要素**数**なので訂正の上限 16 で
 /// 頭打ちになり、「訂正できた一模同样 16」「全然訂正できていない一模同样 16」と
 /// 区別できない（実測: `bit/blk` が全期間 16.0 に張り付いたまま drop が
-/// 0% → 100% に悪化した）。推定误差IES数�� NROOTS/2 を超えた、Chien 検索の
+/// 0% → 100% に悪化した）。推定誤り数が NROOTS/2 を超えた、Chien 検索の
 /// 根数が一致しなかった、Forney の分母が 0、訂正後に syndrome が残った、を
 /// 区別できることが本科の診断上の必須。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,7 +164,7 @@ pub fn decode(block: &[u8]) -> Option<Vec<u8>> {
 /// - 失敗: `(None, nerr, Some(理由))`
 ///
 /// `nerr` は Chien 検索で実際に見つけた根の数であり、BM の `l` と同じなら
-/// 「訂正不能」の意味での误差IES数が直接得られる。
+/// 「訂正不能」の意味での誤り数が直接得られる。
 pub fn decode_detail(block: &[u8]) -> (Option<Vec<u8>>, usize, Option<Fail>) {
     let gf = build_gf();
     let synd = syndromes(block);

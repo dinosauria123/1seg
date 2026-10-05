@@ -23,7 +23,7 @@ fn main() {
         eprintln!("usage: soft_replay <soft.txt> <vit.txt> <byte.hex>");
         return;
     }
-    // 入力が f32 ならそれを使う（量子化版なら文字fallenち）
+    // 入力が f32 ならそれを使う（量子化版なら文字化け）
     let raw0 = std::fs::read_to_string(&a[0]).unwrap();
     let soft_f32: Option<Vec<f32>> = if raw0.trim_start().chars().next()
         .map(|c| c.is_ascii_digit() || c == '-' || c == '+' || c == '.').unwrap_or(false)

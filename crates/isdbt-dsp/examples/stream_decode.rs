@@ -590,7 +590,7 @@ fn main() {
             let _ = out.flush();
             if !announced {
                 announced = true;
-                eprintln!("ロック→ライブ復码開始 (SPS待ち={})", !started);
+                eprintln!("ロック→ライブ復調開始 (SPS待ち={})", !started);
             }
         }
     }

@@ -75,7 +75,7 @@ for f in 485142857 473142857 497142857 509142857 525142857; do
   echo "### 試行 $f"
   tmp=$(mktemp)
   ( timeout 30 "$RTL" -f "$f" -s "$FS" -g 0 - | "$DEC" - - > "$tmp" 2>"$tmp.log" )
-  if grep -q "ロック→ライブ復码開始" "$tmp.log"; then
+  if grep -q "ロック→ライブ復調開始" "$tmp.log"; then
     echo "ロック成功: $f（$(stat -c%s "$tmp") バイト）"
     rm -f "$tmp" "$tmp.log"
     play "$f"

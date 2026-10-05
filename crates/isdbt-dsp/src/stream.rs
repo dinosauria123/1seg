@@ -1186,7 +1186,7 @@ struct Pipe {
     /// `push()` は `self.idx % BI_I` で分岐を選ぶため、idx=0 から
     /// 始于 offline 再生では online と**別の分岐**にバイトが乗り、
     /// 出力バイト列が一致しない（実測: 先頭 1 バイトだけ 0x47 で
-    /// 2 バイト目以降が全滅）。离线侧で idx を合わせる必要がある。
+    /// 2 バイト目以降が全滅）。オフライン側で idx を合わせる必要がある。
     pub dump_deint_idx: usize,
     /// 対象ブロックの記録（soft, vit, byte が同一ブロック由来）。
     pub dump_atom: Option<(Vec<f32>, Vec<u8>, Vec<u8>)>,
@@ -1291,7 +1291,7 @@ impl Pipe {
     ///
     /// 捨てるのは Viterbi のトレリス状態、バイト詰めの繰り越し
     /// （`bit_acc`/`bit_cnt`）、`block_buf` の部分ブロック。
-    /// これらは样本ごとに独立で、保持すると以其整合が壊れる。
+    /// これらはサンプルごとに独立で、保持するとその整合が壊れる。
     /// 内部状態を部分的に初期化して、長時間走ったときの破綻から復帰する。
     ///
     /// 実測 2026-09-26: 同じ IQ を分割して singly デコードすると 0.3〜1.6%、
@@ -3691,7 +3691,7 @@ impl StreamingDecoder {
                 // 落ちるため、視聴上は「後方で画像が崩れる」ことになる。
                 //
                 // `DEGRADATION_INVESTIGATION.md` §5.1 の「warm-up を再利用可能な
-                // 設計にする」 requisite が未達のため、この経路は診断用途に残す
+                // 設計にする」要件が未達のため、この経路は診断用途に残す
                 // だけで、既定では**永久に無効**とする。
                 self.frames_since_reset += 1;
                 if self.frames_since_reset >= reset_frames() {

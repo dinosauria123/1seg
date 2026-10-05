@@ -408,7 +408,7 @@ mod tests {
         }
     }
 
-    /// 注入引数 anatagonist 違っても PAT と PMT の CC は独立していること。
+    /// 注入引数が何であっても PAT と PMT の CC は独立していること。
     #[test]
     fn psi_cc_pat_pmt_independent() {
         // PAT=3, PMT=9 なら両方的 Their CC はそのまま
