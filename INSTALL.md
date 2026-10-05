@@ -147,7 +147,7 @@ ffmpeg -ss 6 -i /tmp/out.ts -frames:v 1 /tmp/frame.png
 ### 5.1 GUI（推奨）
 
 ```bash
-~/oneseg-rs/scripts/oneseg_gui.py
+~/oneseg-rs/oneseg_gui.py
 ```
 
 - **▲ CH / ▼ CH** または **↑↓** キー: チャンネル切替（**循環**。端で反対側へ回る）
@@ -248,10 +248,10 @@ IQDIR=~/captures ~/oneseg-rs/scripts/live_play_direct.sh 509142857
 │   │   │   └── stream.rs    # ストリーミング復調器
 │   │   └── examples/        # 診断・復号ツール
 │   └── isdbt-wasm/          # ブラウザ版（WASM+WebUSB）
+├── oneseg_gui.py          # tkinter GUI
 ├── scripts/
 │   ├── live_play_direct.sh  # ライブ再生（GUI が呼ぶ実体）
 │   ├── stop_live.sh         # 停止・IQ 削除・LED 消灯
-│   ├── oneseg_gui.py        # tkinter GUI
 │   ├── iq_trim.py           # IQ 容量管理（collapse + 累積値通知）
 │   ├── led_ctl.py           # 緑 LED の GPIO 制御
 │   ├── lock_watch.py        # ロック監視
@@ -260,8 +260,7 @@ IQDIR=~/captures ~/oneseg-rs/scripts/live_play_direct.sh 509142857
 │   ├── OPERATION.md         # 仕様と使い方（最重要）
 │   ├── CONSTELLATION_SNR.md # 星座解析・C/N
 │   └── DEGRADATION_INVESTIGATION.md
-├── captures/                # IQ キャプチャ置き場（ext4）
-└── web/                     # ブラウザ版の起動手順
+└── captures/                # IQ キャプチャ置き場（ext4）
 ```
 
 ---

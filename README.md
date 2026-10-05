@@ -92,7 +92,7 @@ ffmpeg -ss 6 -i out.ts -frames:v 1 frame.png
 tkinter 製。▲▼ でチャンネル切替（循環）、▶/■ で再生/停止。
 
 ```bash
-~/oneseg-rs/scripts/oneseg_gui.py
+~/oneseg-rs/oneseg_gui.py
 ```
 
 ### 緑 LED の点灯
@@ -170,7 +170,6 @@ C/N を確保するのはアンテナ／受信環境側の問題です。
 | [`docs/OPERATION.md`](docs/OPERATION.md) | **仕様と使い方**（最重要。復調の段構成、落とし穴、実測値） |
 | [`docs/CONSTELLATION_SNR.md`](docs/CONSTELLATION_SNR.md) | 星座解析と C/N の関係 |
 | [`docs/DEGRADATION_INVESTIGATION.md`](docs/DEGRADATION_INVESTIGATION.md) | 復調劣化の調査記録 |
-| [`web/README.md`](web/README.md) | ブラウザ版のビルドと起動 |
 
 ---
 
