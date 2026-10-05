@@ -60,16 +60,16 @@ STATE_FILE = os.path.join(
     "oneseg-rs", "gui_state.json")
 
 # チャンネル設定は channels.csv から読む（地域ごとに編集する）。
-# 戻り値は従来と同じ 5-tuple: (ch, freq_hz, power, station, remote)
+# 戻り値は (ch, freq_hz, power, station, remote) の 5-tuple。power は CSV に無ければ None。
 CHANNELS_CSV = os.path.join(REPO, "channels.csv")
 
 
 def load_channels(path=CHANNELS_CSV):
     """channels.csv を読み込んでチャンネルリストを返す。
 
-    形式はINSTALL.md / channels.csv のヘッダを参照。`#` コメントと空行は
-    無視する。1 行でも不正があれば、その場で例外を送出して静かに脱落するのを
-    避ける（チャンネルが 1 つ減ったままでも起動してしまうため）。
+    列数は 4（ch, 周波数, 局名, リモコン）または 5（+ 実測電力）。
+    形式は channels.csv のヘッダを参照。`#` コメントと空行は無視する。
+    1 行でも不正があれば起動時に例外で止める（チャンネルが黙って減るのを防ぐ）。
     """
     try:
         with open(path, encoding="utf-8") as f:
@@ -86,25 +86,32 @@ def load_channels(path=CHANNELS_CSV):
         if s.split(",")[0].strip().lower() in ("ch", "チャンネル"):
             continue
         parts = [p.strip() for p in s.split(",")]
-        if len(parts) != 5:
+        if len(parts) not in (4, 5):
             raise SystemExit(
-                f"{path}:{lineno}: 列数が {len(parts)} 個（5 個必要）: {line!r}")
+                f"{path}:{lineno}: 列数が {len(parts)} 個（4 または 5 必要）: {line!r}")
         # Python の int() は桁区切りのアンダースコアを受け付けるので、
         # CSV では許容せず ASCII 数字のみに限定する。
         if not parts[1].isdigit():
             raise SystemExit(
                 f"{path}:{lineno}: 周波数は桁区切りなしの数字で記述 "
                 f"（例: 485142857）: {line!r}")
+        has_power = len(parts) == 5
         try:
             ch = int(parts[0])
             freq = int(parts[1])
-            power = float(parts[2])
-            remote = int(parts[4])
+            if has_power:
+                power = float(parts[2])
+                station, remote = parts[3], int(parts[4])
+            else:
+                station, remote = parts[2], int(parts[3])
         except ValueError as e:
             raise SystemExit(f"{path}:{lineno}: 数値の解釈に失敗 ({e}): {line!r}")
         if freq <= 0:
             raise SystemExit(f"{path}:{lineno}: 周波数が 0 以下: {line!r}")
-        out.append((ch, freq, power, parts[3], remote))
+        # power は任意。無いときは None を入れて 5-tuple の形を保つので、
+        # 呼び出し側（refresh の f-string）が None で落ちるのを避ける。
+        out.append((ch, freq, float(power) if has_power else None,
+                    station, remote))
 
     if not out:
         raise SystemExit(f"チャンネル設定が空です: {path}")
@@ -273,9 +280,10 @@ class App:
         ch, freq, power, station, remote = CHANNELS[self.index]
         name = self.names.get(ch) or station
         self.lbl_ch.config(text=f"{name}    ch{ch}")
-        self.lbl_detail.config(
-            text=f"{freq/1e6:.3f} MHz ・ リモコン {remote} ・ "
-                 f"実測電力 {power:.0f}")
+        detail = f"{freq/1e6:.3f} MHz ・ リモコン {remote}"
+        if power is not None:
+            detail += f" ・ 実測電力 {power:.0f}"
+        self.lbl_detail.config(text=detail)
 
     def playing(self):
         return alive("stream_decode") and alive("ffplay")
