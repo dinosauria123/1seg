@@ -1,7 +1,7 @@
 # 1seg 連続復調の後半劣化 — 調査記録
 
 作成: 2026-09-27
-対象: `~/oneseg-rs` / 札幌 NHK 総合 ch15 (485142857 Hz) / DS-DT-305BK (RTL2832U)
+対象: `~/oneseg-rs` / 札幌 NHK 総合 ch15 (485142857 Hz) / DS-DT308SV (RTL2832U)
 
 ---
 

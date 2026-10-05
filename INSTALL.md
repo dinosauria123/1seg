@@ -19,7 +19,7 @@
 
 | 項目 | 値 | 備考 |
 |---|---|---|
-| SDR ドングル | **DS-DT-305BK**（RTL2832U + Fitipower FC0013） | 他社製でも可 |
+| SDR ドングル | **DS-DT308SV**（RTL2832U + Fitipower FC0013） | 他社製でも可 |
 | アンテナ | 1seg 帯域対応（470〜608 MHz） | 壁面アンテナでも可 |
 | OS 環境 | Linux（Ubuntu 26.04 で検証） | macOS/Windows は未検証 |
 

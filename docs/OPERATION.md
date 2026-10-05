@@ -1,7 +1,7 @@
 # ワンセグ（ISDB-T 1seg）復調器 RTS_SDR — 仕様と使い方
 
 最終更新: 2026-09-26（ライブ映像＋音声の復号を実測確認）
-対象: `/home/dino/oneseg-rs`（Rust workspace）+ DS-DT-305BK（RTL2832U + Fitipower FC0013）
+対象: `/home/dino/oneseg-rs`（Rust workspace）+ DS-DT308SV（RTL2832U + Fitipower FC0013）
 
 ---
 
@@ -18,7 +18,7 @@ ffplay / VLC でそのまま再生できる。ブラウザ版（WASM + WebUSB）
 
 | 項目 | 値 |
 |---|---|
-| チューナ | DS-DT-305BK（`0bda:2832`、RTL2832U + Fitipower FC0013） |
+| チューナ | DS-DT308SV（`0bda:2832`、RTL2832U + Fitipower FC0013） |
 | モード | `rtl2832_sdr` / `dvb_usb_rtl28xxu` を blacklist して `rtl_sdr` から使う |
 | 受信例 | 札幌 NHK総合 ch15 = 485.142857 MHz（NHK教育 ch13 = 473.142857 MHz） |
 | サンプルレート | **1015873 Hz**（実測 exact = 1015873.002204 Hz） |

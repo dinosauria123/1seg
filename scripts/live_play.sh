@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 1seg ライブ視聴: DS-DT-305BK → stream_decode → ffplay / vlc
+# 1seg ライブ視聴: DS-DT308SV → stream_decode → ffplay / vlc
 #
 #   ./scripts/live_play.sh [周波数Hz] [秒数] [player]
 #

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DS-DT-305BK の緑 LED を GPIO で点灯/消灯する。
+"""DS-DT308SV の緑 LED を GPIO で点灯/消灯する。
 
 実測（2026-10-04、ch19 HBC）:
   全 8 GPIO を Hi に**固定**すると緑 LED が点灯する。1本ずつ Hi/Lo を
