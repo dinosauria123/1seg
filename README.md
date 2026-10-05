@@ -35,7 +35,7 @@ cd ~/oneseg-rs
 
 | ソフトウェア | URL | ライセンス | 参考、流用した内容 |
 |---|---|---|---|
-|**RTS_SDR — 自作ワンセグ（ISDB-T 1seg）復調器**|<https://github.com/Ryujiyasu/1seg.git>| GPL-3.0 | オリジナルのソース |
+|**RTS_SDR — 自作ワンセグ（ISDB-T 1seg）復調器**|<https://github.com/Ryujiyasu/1seg.git>| 記載なし | オリジナルのソース |
 | **gr-isdbt** | <https://github.com/git-artes/gr-isdbt> | GPL-3.0 | ISDB-T 固有の処理（TMCC デコード、PRBS エネルギー分散、リセット基準）。ISDB-T 圏で実際に運用されている数少ないオープンソース実装。 |
 | **DAB-Radio** | <https://github.com/williamyang98/DAB-Radio> | （upstream のものを参照） | GNU Radio に依存しない**単体実装**の手本。設計判断（ブロック分割、エラー処理、構成の簡潔さ）の参考にした。 |
 | **rtl-sdr** | <https://github.com/rtlsdr/rtl-sdr> | GPL-3.0 | `rtlsdr_set_bias_tee_gpio()` などの低レベル API の GPIO レジスタ定義。緑 LED の制御に使った。 |
@@ -58,22 +58,6 @@ git clone --depth 1 https://github.com/williamyang98/DAB-Radio.git ref/DAB-Radio
 > 参照実装には ISDB-T 圏（ブラジル・日本）で使用されているオープンソースソフトウェアが含まれます。
 > 本プロジェクトは **合法な地上デジタル放送の受信**（自分の地域で受信できる放送）を
 > 対象としており、復調そのものは暗号解読を含みません。
-
----
-
-## 段構成（信号の流れ）
-
-| 段 | 内容 | 実装ファイル |
-|----|------|------|
-| ① | RF 入力（rtl_sdr の生 IQ → 複素サンプル） | `iq.rs` |
-| ② | **OFDM 同期**（CP 自己相関でシンボル境界 + 小数 CFO） | `sync.rs` |
-| ③ | **チャネル等化**（スキャッタードパイロット） | `pilots.rs` / `equalize.rs` |
-| ④ | TMCC 復号 → デマップ / デインターリーブ | `tmcc.rs` / `deinterleave.rs` / `demap.rs` |
-| ⑤ | FEC（Viterbi + RS(204,188)） | `viterbi.rs` / `rs.rs` |
-| ⑥ | TS 出力（PSI 合成、PTS 正規化、discontinuity 注入） | `ts.rs` / `stream.rs` |
-
-エネルギー分散のリセットは **1 OFDM フレーム = 64 RS ブロックごと**
-（204sym × 384carrier × 2bit × 2/3 ÷ 8 ÷ 204 = 64）。
 
 ---
 
