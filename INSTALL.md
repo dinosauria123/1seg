@@ -247,7 +247,6 @@ IQDIR=~/captures ~/oneseg-rs/scripts/live_play_direct.sh 509142857
 │   │   │   ├── ts.rs        # ⑥ TS 出力・PTS 正規化
 │   │   │   └── stream.rs    # ストリーミング復調器
 │   │   └── examples/        # 診断・復号ツール
-│   └── isdbt-wasm/          # ブラウザ版（WASM+WebUSB）
 ├── oneseg_gui.py          # tkinter GUI
 ├── scripts/
 │   ├── live_play_direct.sh  # ライブ再生（GUI が呼ぶ実体）

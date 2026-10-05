@@ -1,6 +1,6 @@
 //! ストリーミング復調器（ライブラリAPI）：`feed(iq_u8) → ts_bytes` を逐次で。
 //!
-//! CLI（`examples/stream_decode.rs`）と WASM（`isdbt-wasm`）の両方から使う中核。
+//! CLI（`examples/stream_decode.rs`）と GUI フロントエンドの両方から使う中核。
 //! 初期バッファで同期＋整列をロック → 以降は届いたIQを1シンボルずつ復調し、
 //! [`crate::viterbi::ViterbiStreaming`] ＋ 逐次バイトデインタ/逆拡散/RS で TSパケットを吐く。
 

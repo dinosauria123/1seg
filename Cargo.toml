@@ -2,7 +2,7 @@
 # 段構成: ②OFDM同期 → ③等化 → ④demap/deinterleave → ⑤FEC → ⑥TS
 [workspace]
 resolver = "2"
-members = ["crates/isdbt-dsp", "crates/isdbt-wasm"]
+members = ["crates/isdbt-dsp"]
 
 [workspace.package]
 edition = "2021"
