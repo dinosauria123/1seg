@@ -4,6 +4,8 @@ https://github.com/Ryujiyasu/1seg.git
 のコードをFork元にして、UbuntuでDS-DT308SV（RTL2832U + FC0013）で1seg再生するコードです。
 Hermes Agent（space-bunny-alpha）にお任せで開発しています。
 
+<img width="2559" height="1439" alt="image" src="https://github.com/user-attachments/assets/46974ffd-45a7-407e-807e-1d3a6d9ef1d8" />
+
 以下引用と追記です。
 
 Zox製 DS-DT308SV USBドングルで受けた IQ から、**ISDB-T のワンセグ（1セグメント）を自前で復調**する
