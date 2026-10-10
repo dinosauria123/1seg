@@ -13,7 +13,7 @@
 # 使い方: ./scripts/live_play_direct.sh [周波数Hz]
 # 停止:   ./scripts/stop_live.sh
 set -uo pipefail
-cd ~/oneseg-rs
+cd "$(dirname "$(readlink -f "$0")")/.."
 export DISPLAY="${DISPLAY:-:0}"
 export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
 
@@ -52,12 +52,14 @@ ALIVE=/tmp/isdbt_writer.alive
 # 注意: **stop_live.sh より後ろで起動すること。** stop_live.sh は
 # lock_watch.py も（PID ファイル経由で）kill するので、先に起動すると
 # 即座に殺される。
-bash "$HOME/oneseg-rs/scripts/stop_live.sh" >/dev/null 2>&1
+REPO="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+SCRIPTS="$REPO/scripts"
+bash "$SCRIPTS/stop_live.sh" >/dev/null 2>&1
 sleep 1
 
 PIDF=/tmp/isdbt_launcher.pid
 : > /tmp/isdbt_lock.log
-nohup python3 "$HOME/oneseg-rs/scripts/lock_watch.py" >/dev/null 2>&1 &
+nohup python3 "$SCRIPTS/lock_watch.py" >/dev/null 2>&1 &
 WATCH_PID=$!
 # stop_live.sh が PID ファイルで落とせるように記録する（`pgrep -f` は
 # 呼び出し元シェルにマッチして自爆するため使わない）。
@@ -91,7 +93,7 @@ rm -f "$IQFIFO" "$ALIVE"
 # ext4 なら collapse が効くので、iq_trim.py の容量制限が機能する。
 #
 # FIFO（isdbt_iq.fifo / isdbt_ts_*.fifo）は速度 때문에 tmpfs のまま。
-IQDIR="${IQDIR:-$HOME/oneseg-rs/captures/live}"
+IQDIR="${IQDIR:-$REPO/captures/live}"
 mkdir -p "$IQDIR"
 IQFILE="$IQDIR/isdbt_iq_${FREQ}.iq"
 TSFIFO="/tmp/isdbt_ts_${FREQ}.fifo"
@@ -140,7 +142,7 @@ sleep 1
 # を頭から潰す（inode を保ち、末尾をずらすので fd 3 は有効）。
 TRIM_LOG=/tmp/isdbt_trim.log
 : > "$TRIM_LOG"
-nohup /usr/bin/python3 "$HOME/oneseg-rs/scripts/iq_trim.py" \
+nohup /usr/bin/python3 "$SCRIPTS/iq_trim.py" \\
   "$IQFILE" "$IQ_KEEP" "$TRIM_LOG" >/dev/null 2>&1 &
 TRIM_PID=$!
 echo "$TRIM_PID" >> "$PIDF"
@@ -166,7 +168,7 @@ echo "$TRIM_PID" >> "$PIDF"
 # `LED=0` で無効化。
 if [ "${LED:-1}" = "1" ]; then
   # rtl_sdr はまだ起動していないので、デバイスは空いている。
-  /usr/bin/python3 "$HOME/oneseg-rs/scripts/led_ctl.py" set >>"$LOG" 2>&1 \
+  /usr/bin/python3 "$SCRIPTS/led_ctl.py" set >>"$LOG" 2>&1 \
     || echo "警告: LED 点灯に失敗（続行する）" >&2
 fi
 
@@ -260,4 +262,4 @@ FFPLAY_PID=$!
 echo "ffplay=$FFPLAY_PID  dec=$DEC_PID  lock_watch=$WATCH_PID"
 echo "ロック監視: tail -f /tmp/isdbt_lock.log   ← 1〜2 分待つとロック到達が出る"
 echo "ログ: $LOG / $PLOG"
-echo "停止: $HOME/oneseg-rs/scripts/stop_live.sh  （lock_watch も一緒に止まる）"
+echo "停止: bash $SCRIPTS/stop_live.sh  （lock_watch も一緒に止まる）"
